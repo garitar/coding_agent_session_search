@@ -149,6 +149,10 @@ pub enum Commands {
         /// Filter to entries until ISO date
         #[arg(long)]
         until: Option<String>,
+        /// Include conversation turns around each hit. Can be a single number (N turns before and after)
+        /// or "before,after" for asymmetric context (e.g., "3,5" = 3 before, 5 after)
+        #[arg(long, short = 'T')]
+        turns: Option<String>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -448,6 +452,7 @@ async fn execute_cli(
                     week,
                     since,
                     until,
+                    turns,
                 } => {
                     run_cli_search(
                         &query,
@@ -468,6 +473,7 @@ async fn execute_cli(
                             since.as_deref(),
                             until.as_deref(),
                         ),
+                        turns,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -638,6 +644,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --days N          Filter to last N days".to_string(),
             "    --since DATE      Filter from date (YYYY-MM-DD)".to_string(),
             "    --until DATE      Filter to date (YYYY-MM-DD)".to_string(),
+            "    --turns N / -T N  Include N turns before/after each hit (or \"B,A\" for asymmetric)".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--data-dir DIR]".to_string(),
@@ -664,7 +671,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         }
         RobotTopic::Schemas => vec![
             "schemas:".to_string(),
-            "  search: {query:str,limit:int,offset:int,count:int,hits:[{score:f64,agent:str,workspace:str,source_path:str,snippet:str,content:str,title:str,created_at:int?,line_number:int?}]}".to_string(),
+            "  search: {query:str,limit:int,offset:int,count:int,hits:[{score:f64,agent:str,workspace:str,source_path:str,snippet:str,content:str,title:str,created_at:int?,line_number:int?,context?:[{role:str,content:str,turn_index:int,is_match?:bool}]}]}".to_string(),
             "  error: {error:{code:int,kind:str,message:str,hint:str?,retryable:bool}}".to_string(),
             "  trace: {start_ts:str,end_ts:str,duration_ms:u128,cmd:str,args:[str],exit_code:int,error:?}".to_string(),
         ],
@@ -841,6 +848,7 @@ fn run_cli_search(
     wrap: WrapConfig,
     _progress: ProgressResolved,
     time_filter: TimeFilter,
+    turns: Option<String>,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -885,7 +893,7 @@ fn run_cli_search(
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
 
-    let hits = client
+    let mut hits = client
         .search(query, filters, *limit, *offset)
         .map_err(|e| CliError {
             code: 9,
@@ -894,6 +902,38 @@ fn run_cli_search(
             hint: None,
             retryable: true,
         })?;
+
+    // Fetch surrounding turns if requested
+    // Parse turns as either "N" (symmetric) or "before,after" (asymmetric)
+    if let Some(turns_str) = turns {
+        let (turns_before, turns_after) = if turns_str.contains(',') {
+            let parts: Vec<&str> = turns_str.split(',').collect();
+            if parts.len() == 2 {
+                let before = parts[0].trim().parse::<usize>().unwrap_or(2);
+                let after = parts[1].trim().parse::<usize>().unwrap_or(2);
+                (before, after)
+            } else {
+                (2, 2) // fallback default
+            }
+        } else {
+            let n = turns_str.parse::<usize>().unwrap_or(2);
+            (n, n) // symmetric
+        };
+
+        for hit in &mut hits {
+            // If hit doesn't have conversation_id (e.g., from Tantivy), enrich it from SQLite
+            if hit.conversation_id.is_none() {
+                let _ = client.enrich_hit_for_context(hit);
+            }
+            if let (Some(conv_id), Some(line_num)) = (hit.conversation_id, hit.line_number) {
+                // line_number is 1-indexed, convert back to 0-indexed idx
+                let match_idx = (line_num - 1) as i64;
+                if let Ok(context) = client.fetch_surrounding_turns(conv_id, match_idx, turns_before, turns_after) {
+                    hit.context = Some(context);
+                }
+            }
+        }
+    }
 
     if *json {
         let payload = serde_json::json!({
@@ -923,6 +963,23 @@ fn run_cli_search(
             println!("Path: {}", hit.source_path);
             let snippet = hit.snippet.replace('\n', " ");
             println!("Snippet: {}", apply_wrap(&snippet, wrap));
+
+            // Print context turns if available
+            if let Some(ref context) = hit.context {
+                println!("\nContext ({} turns, use --json for full content):", context.len());
+                for turn in context {
+                    let marker = if turn.is_match { ">>>" } else { "   " };
+                    let role_display = format!("[{}]", turn.role);
+                    // Preview first 200 chars, with newlines replaced for readability
+                    let content_clean = turn.content.replace('\n', " ");
+                    let content_preview: String = content_clean.chars().take(200).collect();
+                    let ellipsis = if turn.content.len() > 200 { "..." } else { "" };
+                    println!(
+                        "{} {} {}: {}{}",
+                        marker, turn.turn_index, role_display, content_preview, ellipsis
+                    );
+                }
+            }
         }
         println!("----------------------------------------------------------------");
     }

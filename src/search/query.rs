@@ -27,6 +27,20 @@ pub struct SearchFilters {
     pub created_to: Option<i64>,
 }
 
+/// A conversation turn included as context around a search hit
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextTurn {
+    /// The role of this turn (e.g., "user", "assistant")
+    pub role: String,
+    /// The content of this turn
+    pub content: String,
+    /// The position of this turn in the conversation (0-indexed)
+    pub turn_index: i64,
+    /// Whether this is the matched turn (the search hit itself)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_match: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub title: String,
@@ -39,6 +53,15 @@ pub struct SearchHit {
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
     pub line_number: Option<usize>,
+    /// Internal message ID (used for context fetching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    /// Internal conversation ID (used for context fetching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<i64>,
+    /// Surrounding conversation turns (populated when --turns is used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Vec<ContextTurn>>,
 }
 
 pub struct SearchClient {
@@ -480,6 +503,9 @@ impl SearchClient {
                 workspace,
                 created_at,
                 line_number: None, // TODO: populate from index if stored
+                message_id: None,  // Not available from Tantivy index
+                conversation_id: None,
+                context: None,
             });
         }
         Ok(hits)
@@ -498,7 +524,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx
+            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id
              FROM fts_messages f
              LEFT JOIN messages m ON f.message_id = m.id
              WHERE fts_messages MATCH ?",
@@ -555,6 +581,8 @@ impl SearchClient {
                 // idx is 0-indexed message index; convert to 1-indexed line number for JSONL files
                 let idx: Option<i64> = row.get(8).ok();
                 let line_number = idx.map(|i| (i + 1) as usize);
+                let message_id: Option<i64> = row.get(9).ok();
+                let conversation_id: Option<i64> = row.get(10).ok();
                 Ok(SearchHit {
                     title,
                     snippet,
@@ -565,6 +593,9 @@ impl SearchClient {
                     workspace,
                     created_at,
                     line_number,
+                    message_id,
+                    conversation_id,
+                    context: None,
                 })
             },
         )?;
@@ -574,6 +605,104 @@ impl SearchClient {
             hits.push(row?);
         }
         Ok(hits)
+    }
+
+    /// Enrich a SearchHit with message_id and conversation_id from SQLite.
+    /// This is used when Tantivy search finds results but we need context.
+    pub fn enrich_hit_for_context(&self, hit: &mut SearchHit) -> Result<()> {
+        let conn = self.sqlite.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("SQLite connection not available for hit enrichment")
+        })?;
+
+        // Look up the message by content (first 500 chars to handle truncation)
+        let content_prefix: String = hit.content.chars().take(500).collect();
+        let sql = "SELECT m.id, m.conversation_id, m.idx FROM messages m
+                   WHERE m.content LIKE ? || '%'
+                   LIMIT 1";
+
+        let mut stmt = conn.prepare(sql)?;
+        let result = stmt.query_row([&content_prefix], |row| {
+            let id: i64 = row.get(0)?;
+            let conversation_id: i64 = row.get(1)?;
+            let idx: i64 = row.get(2)?;
+            Ok((id, conversation_id, idx))
+        });
+
+        if let Ok((id, conv_id, idx)) = result {
+            hit.message_id = Some(id);
+            hit.conversation_id = Some(conv_id);
+            hit.line_number = Some((idx + 1) as usize);
+        }
+        Ok(())
+    }
+
+    /// Fetch surrounding conversation turns for a given message.
+    /// Returns N actual turns before and after the matched message (not index positions).
+    pub fn fetch_surrounding_turns(
+        &self,
+        conversation_id: i64,
+        match_idx: i64,
+        turns_before: usize,
+        turns_after: usize,
+    ) -> Result<Vec<ContextTurn>> {
+        let conn = self.sqlite.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("SQLite connection not available for context fetching")
+        })?;
+
+        let mut turns = Vec::new();
+
+        // Get N turns before (and including) the match, ordered by idx DESC, then reverse
+        let sql_before = "SELECT idx, role, content FROM messages
+                          WHERE conversation_id = ? AND idx <= ?
+                          ORDER BY idx DESC
+                          LIMIT ?";
+        let mut stmt = conn.prepare(sql_before)?;
+        let rows = stmt.query_map(
+            rusqlite::params![conversation_id, match_idx, turns_before as i64 + 1],
+            |row| {
+                let idx: i64 = row.get(0)?;
+                let role: String = row.get(1)?;
+                let content: String = row.get(2)?;
+                Ok(ContextTurn {
+                    turn_index: idx,
+                    role,
+                    content,
+                    is_match: idx == match_idx,
+                })
+            },
+        )?;
+
+        for row in rows {
+            turns.push(row?);
+        }
+        turns.reverse(); // Put in chronological order
+
+        // Get N turns after the match
+        let sql_after = "SELECT idx, role, content FROM messages
+                         WHERE conversation_id = ? AND idx > ?
+                         ORDER BY idx ASC
+                         LIMIT ?";
+        let mut stmt = conn.prepare(sql_after)?;
+        let rows = stmt.query_map(
+            rusqlite::params![conversation_id, match_idx, turns_after as i64],
+            |row| {
+                let idx: i64 = row.get(0)?;
+                let role: String = row.get(1)?;
+                let content: String = row.get(2)?;
+                Ok(ContextTurn {
+                    turn_index: idx,
+                    role,
+                    content,
+                    is_match: false, // These are after the match
+                })
+            },
+        )?;
+
+        for row in rows {
+            turns.push(row?);
+        }
+
+        Ok(turns)
     }
 }
 
@@ -905,6 +1034,9 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
+            message_id: None,
+            conversation_id: None,
+            context: None,
         }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
@@ -928,6 +1060,9 @@ mod tests {
             workspace: "w".into(),
             created_at: None,
             line_number: None,
+            message_id: None,
+            conversation_id: None,
+            context: None,
         };
         let cached = cached_hit_from(&hit);
         assert!(hit_matches_query_cached(&cached, "hello"));
