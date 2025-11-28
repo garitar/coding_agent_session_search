@@ -25,6 +25,8 @@ pub struct SearchFilters {
     pub workspaces: HashSet<String>,
     pub created_from: Option<i64>,
     pub created_to: Option<i64>,
+    /// Filter by message role (e.g., "user", "assistant")
+    pub role: Option<String>,
 }
 
 /// A conversation turn included as context around a search hit
@@ -570,6 +572,10 @@ impl SearchClient {
         if filters.created_to.is_some() {
             sql.push_str(" AND f.created_at <= ?");
             params.push(Box::new(filters.created_to.unwrap()));
+        }
+        if let Some(ref role) = filters.role {
+            sql.push_str(" AND m.role = ?");
+            params.push(Box::new(role.clone()));
         }
 
         sql.push_str(" ORDER BY score LIMIT ? OFFSET ?");

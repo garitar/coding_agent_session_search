@@ -161,6 +161,9 @@ pub enum Commands {
         /// Show model on each turn (by default only shown in headline)
         #[arg(long)]
         full_model: bool,
+        /// Filter by message role (user or assistant)
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -464,6 +467,7 @@ async fn execute_cli(
                     snippet_len,
                     no_content,
                     full_model,
+                    from,
                 } => {
                     run_cli_search(
                         &query,
@@ -488,6 +492,7 @@ async fn execute_cli(
                         snippet_len,
                         no_content,
                         full_model,
+                        from,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -866,6 +871,7 @@ fn run_cli_search(
     snippet_len: usize,
     no_content: bool,
     full_model: bool,
+    from: Option<String>,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -909,6 +915,7 @@ fn run_cli_search(
     }
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
+    filters.role = from;
 
     let mut hits = client
         .search(query, filters, *limit, *offset)
