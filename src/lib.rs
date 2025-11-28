@@ -887,7 +887,7 @@ struct ToolInfo {
 }
 
 /// Fetch tool calls and results from a source JSONL file around a matched message.
-/// Returns tools within the same conversation turn (typically the assistant response + following user results).
+/// Returns tools within the same conversation turn only (stops at turn boundaries).
 fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, match_role: Option<&str>) -> Vec<ToolInfo> {
     use std::collections::HashMap;
     use std::fs::File;
@@ -903,19 +903,20 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
     let mut tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new(); // id -> (name, input)
 
     // Define search window based on role:
-    // - User messages: look FORWARD only (tools are in the response)
-    // - Assistant messages: look at the current turn (small window before, larger after)
+    // - User messages: look FORWARD only (tools are in the response), stop at next user text
+    // - Assistant messages: look BACKWARD only (tools precede the response), stop at previous user text
     let (window_start, window_end) = match match_role {
-        Some("user") => (match_line, match_line + 100), // Only forward for user messages
-        _ => (match_line.saturating_sub(10), match_line + 50), // Small backward, larger forward for assistant
+        Some("user") => (match_line, match_line + 30), // Forward for user messages
+        _ => (match_line.saturating_sub(20), match_line), // Backward for assistant
     };
+    let mut found_turn_boundary = false;
 
     for (idx, line_result) in reader.lines().enumerate() {
         let line_num = idx + 1; // 1-indexed
         if line_num < window_start {
             continue;
         }
-        if line_num > window_end {
+        if line_num > window_end || found_turn_boundary {
             break;
         }
 
@@ -930,6 +931,32 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
         };
 
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Check for turn boundary (text message that's not tool-related)
+        // For user match looking forward: stop at next user text message
+        // For assistant match looking backward: we're already bounded by window_end = match_line
+        if match_role == Some("user") && line_num > match_line {
+            // Check if this is a user TEXT message (not tool_result)
+            if msg_type == "user" {
+                if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
+                    // If content is a string (text), not array (tool_result), it's a turn boundary
+                    if content.is_string() {
+                        found_turn_boundary = true;
+                        continue;
+                    }
+                }
+            }
+            // Also check for assistant text message (next response starting)
+            if msg_type == "assistant" {
+                if let Some(content) = val.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                    // Check if any content item is text (not tool_use)
+                    if content.iter().any(|item| item.get("type").and_then(|t| t.as_str()) == Some("text")) {
+                        found_turn_boundary = true;
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Handle Claude Code format (tool_use in assistant messages, tool_result in user messages)
         if msg_type == "assistant" {
@@ -1420,13 +1447,22 @@ fn run_cli_search(
                     if !fetched_tools.is_empty() {
                         println!("\n{}Tools ({} calls):{}", dim, fetched_tools.len(), reset);
                         for tool in &fetched_tools {
-                            let input_display = tool.input.as_ref()
-                                .map(|i| format!(" input: {}", i.replace('\n', " ")))
-                                .unwrap_or_default();
-                            let output_display = tool.output.as_ref()
-                                .map(|o| format!(" → {}", o.replace('\n', " ")))
-                                .unwrap_or_default();
-                            println!("  {}[{}]{}{}{}", dim, tool.name, reset, input_display, output_display);
+                            // Multi-line format matching original design
+                            println!("  {}[{}]{}", dim, tool.name, reset);
+                            if let Some(ref input) = tool.input {
+                                println!("  input:");
+                                // Indent each line of input
+                                for line in input.lines() {
+                                    println!("    {}", line);
+                                }
+                            }
+                            if let Some(ref output) = tool.output {
+                                println!("  → output:");
+                                // Indent each line of output
+                                for line in output.lines() {
+                                    println!("    {}", line);
+                                }
+                            }
                         }
                     }
                 }
