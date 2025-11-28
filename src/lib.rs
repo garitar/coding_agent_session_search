@@ -172,6 +172,12 @@ pub enum Commands {
         /// Show tool calls/results from source file (optional char limit, default 200 if flag used, 0 = no limit)
         #[arg(long, num_args = 0..=1, default_missing_value = "200")]
         tools: Option<usize>,
+        /// Include context continuation/summary messages (excluded by default)
+        #[arg(long)]
+        include_summaries: bool,
+        /// Include IDE autocontext messages like "# Context from my IDE setup" (excluded by default)
+        #[arg(long)]
+        include_autocontext: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -478,6 +484,8 @@ async fn execute_cli(
                     from,
                     model,
                     tools,
+                    include_summaries,
+                    include_autocontext,
                 } => {
                     run_cli_search(
                         &query,
@@ -505,6 +513,8 @@ async fn execute_cli(
                         from,
                         model,
                         tools,
+                        include_summaries,
+                        include_autocontext,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -1099,6 +1109,8 @@ fn run_cli_search(
     from: Option<String>,
     model_patterns: Vec<String>,
     tools: Option<usize>,
+    include_summaries: bool,
+    include_autocontext: bool,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -1200,6 +1212,23 @@ fn run_cli_search(
     // Post-filter by model patterns (Tantivy doesn't have model indexed, must filter after)
     if !model_patterns.is_empty() {
         hits.retain(|hit| model_matches(&hit.model, &model_patterns));
+    }
+
+    // Filter out summary/continuation messages unless explicitly included
+    if !include_summaries {
+        hits.retain(|hit| {
+            !hit.content.contains("This session is being continued from a previous conversation")
+                && !hit.content.contains("conversation is summarized below")
+                && !hit.content.contains("context compaction")
+        });
+    }
+
+    // Filter out IDE autocontext messages unless explicitly included
+    if !include_autocontext {
+        hits.retain(|hit| {
+            !hit.content.starts_with("# Context from my IDE setup")
+                && !hit.content.contains("\n# Context from my IDE setup")
+        });
     }
 
     if *json {
