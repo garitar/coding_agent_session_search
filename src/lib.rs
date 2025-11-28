@@ -1372,24 +1372,40 @@ fn run_cli_search(
             );
             println!("Path: {}", hit.source_path);
 
-            // Show content/snippet unless --no-content
+            // Show matched message in context turn format unless --no-content
             if !no_content {
+                // Format: >>> [agent] timestamp [N chars]
+                //           content...
+                let role = hit.role.as_deref().unwrap_or("assistant");
+                let role_color = if role == "user" { user_color } else { agent_color };
+                let agent_display = format!("{}[{}]{}", role_color, hit.agent, reset);
+
+                // Format timestamp if available
+                let ts_display = hit.created_at
+                    .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts))
+                    .map(|dt| format!(" {}", dt.format("%Y-%m-%d %H:%M:%S")))
+                    .unwrap_or_default();
+
+                let char_count = hit.content.chars().count();
+                println!("\n>>> {}{}{} [{} chars]", agent_display, ts_display, reset, char_count);
+
+                // Show content with indentation
                 if snippet_len == 0 {
                     // Full content with preserved newlines
-                    println!("Content:");
                     for line in hit.content.lines() {
                         println!("  {}", line);
                     }
-                } else if snippet_len != 200 {
-                    // Custom length preview from content
-                    let content_clean = hit.content.replace('\n', " ");
-                    let preview: String = content_clean.chars().take(snippet_len).collect();
-                    let ellipsis = if hit.content.chars().count() > snippet_len { "..." } else { "" };
-                    println!("Snippet: {}{}", apply_wrap(&preview, wrap), ellipsis);
                 } else {
-                    // Default: use pre-computed snippet
-                    let snippet = hit.snippet.replace('\n', " ");
-                    println!("Snippet: {}", apply_wrap(&snippet, wrap));
+                    // Truncated preview
+                    let effective_len = if snippet_len == 200 { 500 } else { snippet_len }; // Default to longer for this format
+                    let preview: String = hit.content.chars().take(effective_len).collect();
+                    let ellipsis = if hit.content.chars().count() > effective_len { "..." } else { "" };
+                    for line in preview.lines() {
+                        println!("  {}", line);
+                    }
+                    if !ellipsis.is_empty() {
+                        println!("  {}", ellipsis);
+                    }
                 }
             }
 
