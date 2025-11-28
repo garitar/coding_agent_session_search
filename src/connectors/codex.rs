@@ -95,6 +95,9 @@ impl Connector for CodexConnector {
 
             if ext == Some("jsonl") {
                 // Modern envelope format: each line has {type, timestamp, payload}
+                // Track current model from turn_context entries
+                let mut current_model: Option<String> = None;
+
                 for line in content.lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -123,8 +126,23 @@ impl Connector for CodexConnector {
                                     .get("cwd")
                                     .and_then(|v| v.as_str())
                                     .map(PathBuf::from);
+                                // Also check for model in session_meta
+                                if current_model.is_none() {
+                                    current_model = payload
+                                        .get("model_provider")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                }
                             }
                             started_at = started_at.or(created);
+                        }
+                        "turn_context" => {
+                            // Extract model from turn context
+                            if let Some(payload) = val.get("payload") {
+                                if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                                    current_model = Some(model.to_string());
+                                }
+                            }
                         }
                         "response_item" => {
                             // Main message entries with nested payload
@@ -149,7 +167,7 @@ impl Connector for CodexConnector {
                                 messages.push(NormalizedMessage {
                                     idx: 0, // will be re-assigned after filtering
                                     role: role.to_string(),
-                                    author: None,
+                                    author: current_model.clone(),
                                     created_at: created,
                                     content: content_str,
                                     extra: val,
@@ -173,10 +191,10 @@ impl Connector for CodexConnector {
                                             messages.push(NormalizedMessage {
                                                 idx: 0, // will be re-assigned after filtering
                                                 role: "user".to_string(),
-                                                author: None,
+                                                author: current_model.clone(),
                                                 created_at: created,
                                                 content: text.to_string(),
-                                                extra: val,
+                                                extra: val.clone(),
                                                 snippets: Vec::new(),
                                             });
                                         }
@@ -192,10 +210,10 @@ impl Connector for CodexConnector {
                                             messages.push(NormalizedMessage {
                                                 idx: 0, // will be re-assigned after filtering
                                                 role: "assistant".to_string(),
-                                                author: Some("reasoning".to_string()),
+                                                author: current_model.clone(),
                                                 created_at: created,
                                                 content: text.to_string(),
-                                                extra: val,
+                                                extra: val.clone(),
                                                 snippets: Vec::new(),
                                             });
                                         }
