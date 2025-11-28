@@ -152,6 +152,12 @@ pub enum Commands {
         /// or "before:after" for asymmetric context (e.g., "2:5" = 2 before, 5 after)
         #[arg(long, short = 'T')]
         turns: Option<String>,
+        /// Max characters for snippet/preview in text output (default 200, 0 = full content)
+        #[arg(long, short = 'S', default_value = "200")]
+        snippet_len: usize,
+        /// Hide main content/snippet, show only context turns (use with -T)
+        #[arg(long)]
+        no_content: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -452,6 +458,8 @@ async fn execute_cli(
                     since,
                     until,
                     turns,
+                    snippet_len,
+                    no_content,
                 } => {
                     run_cli_search(
                         &query,
@@ -473,6 +481,8 @@ async fn execute_cli(
                             until.as_deref(),
                         ),
                         turns,
+                        snippet_len,
+                        no_content,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -848,6 +858,8 @@ fn run_cli_search(
     _progress: ProgressResolved,
     time_filter: TimeFilter,
     turns: Option<String>,
+    snippet_len: usize,
+    no_content: bool,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -935,12 +947,33 @@ fn run_cli_search(
     }
 
     if *json {
+        // Apply snippet_len to JSON content if not 0 (full)
+        let hits_for_json: Vec<_> = if snippet_len > 0 {
+            hits.iter().map(|hit| {
+                let mut h = hit.clone();
+                if h.content.chars().count() > snippet_len {
+                    h.content = h.content.chars().take(snippet_len).collect::<String>() + "...";
+                }
+                // Also truncate context turn content
+                if let Some(ref mut ctx) = h.context {
+                    for turn in ctx.iter_mut() {
+                        if turn.content.chars().count() > snippet_len {
+                            turn.content = turn.content.chars().take(snippet_len).collect::<String>() + "...";
+                        }
+                    }
+                }
+                h
+            }).collect()
+        } else {
+            hits.clone()
+        };
         let payload = serde_json::json!({
             "query": query,
             "limit": limit,
             "offset": offset,
-            "count": hits.len(),
-            "hits": hits,
+            "count": hits_for_json.len(),
+            "hits": hits_for_json,
+            "snippet_len": if snippet_len > 0 { Some(snippet_len) } else { None::<usize> },
         });
         let out = serde_json::to_string_pretty(&payload).map_err(|e| CliError {
             code: 9,
@@ -953,34 +986,81 @@ fn run_cli_search(
     } else if hits.is_empty() {
         eprintln!("No results found.");
     } else {
-        for hit in &hits {
-            println!("----------------------------------------------------------------");
-            println!(
-                "Score: {:.2} | Agent: {} | WS: {}",
-                hit.score, hit.agent, hit.workspace
+        // ANSI color codes
+        let (user_color, agent_color, reset, dim, bold) = if std::io::stdout().is_terminal() {
+            ("\x1b[34m", "\x1b[32m", "\x1b[0m", "\x1b[2m", "\x1b[1m")
+        } else {
+            ("", "", "", "", "")
+        };
+
+        for (i, hit) in hits.iter().enumerate() {
+            // Better separator with hit number
+            println!("{}═══════════════════════════════════════════════════════════════════{}", dim, reset);
+            println!("{}[{}/{}]{} Score: {:.2} | Agent: {} | WS: {}",
+                bold, i + 1, hits.len(), reset, hit.score, hit.agent, hit.workspace
             );
             println!("Path: {}", hit.source_path);
-            let snippet = hit.snippet.replace('\n', " ");
-            println!("Snippet: {}", apply_wrap(&snippet, wrap));
+
+            // Show content/snippet unless --no-content
+            if !no_content {
+                if snippet_len == 0 {
+                    // Full content with preserved newlines
+                    println!("Content:");
+                    for line in hit.content.lines() {
+                        println!("  {}", line);
+                    }
+                } else if snippet_len != 200 {
+                    // Custom length preview from content
+                    let content_clean = hit.content.replace('\n', " ");
+                    let preview: String = content_clean.chars().take(snippet_len).collect();
+                    let ellipsis = if hit.content.chars().count() > snippet_len { "..." } else { "" };
+                    println!("Snippet: {}{}", apply_wrap(&preview, wrap), ellipsis);
+                } else {
+                    // Default: use pre-computed snippet
+                    let snippet = hit.snippet.replace('\n', " ");
+                    println!("Snippet: {}", apply_wrap(&snippet, wrap));
+                }
+            }
 
             // Print context turns if available
             if let Some(ref context) = hit.context {
-                println!("\nContext ({} turns, use --json for full content):", context.len());
+                let hint = if snippet_len == 0 { "" } else { ", use --json or -S 0 for full content" };
+                println!("\nContext ({} messages{}):", context.len(), hint);
                 for turn in context {
                     let marker = if turn.is_match { ">>>" } else { "   " };
-                    let role_display = format!("[{}]", turn.role);
-                    // Preview first 200 chars, with newlines replaced for readability
-                    let content_clean = turn.content.replace('\n', " ");
-                    let content_preview: String = content_clean.chars().take(200).collect();
-                    let ellipsis = if turn.content.len() > 200 { "..." } else { "" };
-                    println!(
-                        "{} {} {}: {}{}",
-                        marker, turn.turn_index, role_display, content_preview, ellipsis
-                    );
+                    let role_color = if turn.role == "user" { user_color } else { agent_color };
+                    let role_display = format!("{}[{}]{}", role_color, turn.role, reset);
+
+                    // Format timestamp if available
+                    let ts_display = turn.created_at
+                        .and_then(|ts| chrono::DateTime::from_timestamp_millis(ts))
+                        .map(|dt| format!(" {}{}{}", dim, dt.format("%H:%M:%S"), reset))
+                        .unwrap_or_default();
+
+                    // Full content: preserve newlines with indent; preview: collapse to single line
+                    if snippet_len == 0 {
+                        let lines: Vec<&str> = turn.content.lines().collect();
+                        if let Some((first, rest)) = lines.split_first() {
+                            println!("{} {} {}{}: {}", marker, turn.turn_index, role_display, ts_display, first);
+                            for line in rest {
+                                println!("       {}", line);
+                            }
+                        } else {
+                            println!("{} {} {}{}: ", marker, turn.turn_index, role_display, ts_display);
+                        }
+                    } else {
+                        let content_clean = turn.content.replace('\n', " ");
+                        let preview: String = content_clean.chars().take(snippet_len).collect();
+                        let ellipsis = if turn.content.chars().count() > snippet_len { "..." } else { "" };
+                        println!(
+                            "{} {} {}{}: {}{}",
+                            marker, turn.turn_index, role_display, ts_display, preview, ellipsis
+                        );
+                    }
                 }
             }
         }
-        println!("----------------------------------------------------------------");
+        println!("{}═══════════════════════════════════════════════════════════════════{}", dim, reset);
     }
 
     Ok(())
