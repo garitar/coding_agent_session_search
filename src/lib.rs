@@ -169,6 +169,9 @@ pub enum Commands {
         /// "*opus" matches suffix, "\"exact\"" matches exactly.
         #[arg(long)]
         model: Vec<String>,
+        /// Show tool calls/results from source file (optional char limit, default 200 if flag used, 0 = no limit)
+        #[arg(long, num_args = 0..=1, default_missing_value = "200")]
+        tools: Option<usize>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -474,6 +477,7 @@ async fn execute_cli(
                     full_model,
                     from,
                     model,
+                    tools,
                 } => {
                     run_cli_search(
                         &query,
@@ -500,6 +504,7 @@ async fn execute_cli(
                         full_model,
                         from,
                         model,
+                        tools,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -861,6 +866,180 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     None
 }
 
+/// Tool call/result info extracted from source file
+#[derive(Debug, Clone)]
+struct ToolInfo {
+    name: String,
+    #[allow(dead_code)]
+    id: String,
+    input: Option<String>,    // Tool call input (for tool_use)
+    output: Option<String>,   // Tool result output (for tool_result)
+}
+
+/// Fetch tool calls and results from a source JSONL file around a matched message.
+/// Returns tools within the same conversation turn (typically the assistant response + following user results).
+fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, match_role: Option<&str>) -> Vec<ToolInfo> {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = match File::open(source_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = BufReader::new(file);
+    let mut tools = Vec::new();
+    let mut tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new(); // id -> (name, input)
+
+    // Define search window based on role:
+    // - User messages: look FORWARD only (tools are in the response)
+    // - Assistant messages: look at the current turn (small window before, larger after)
+    let (window_start, window_end) = match match_role {
+        Some("user") => (match_line, match_line + 100), // Only forward for user messages
+        _ => (match_line.saturating_sub(10), match_line + 50), // Small backward, larger forward for assistant
+    };
+
+    for (idx, line_result) in reader.lines().enumerate() {
+        let line_num = idx + 1; // 1-indexed
+        if line_num < window_start {
+            continue;
+        }
+        if line_num > window_end {
+            break;
+        }
+
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let val: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Handle Claude Code format (tool_use in assistant messages, tool_result in user messages)
+        if msg_type == "assistant" {
+            if let Some(content) = val.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for item in content {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let input = item.get("input").map(|v| {
+                            let s = serde_json::to_string(v).unwrap_or_default();
+                            if limit > 0 && s.chars().count() > limit {
+                                format!("{}...", s.chars().take(limit).collect::<String>())
+                            } else {
+                                s
+                            }
+                        });
+                        if !id.is_empty() {
+                            tool_calls.insert(id.clone(), (name.clone(), input.clone()));
+                            tools.push(ToolInfo {
+                                name,
+                                id,
+                                input,
+                                output: None,
+                            });
+                        }
+                    }
+                }
+            }
+        } else if msg_type == "user" {
+            if let Some(content) = val.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for item in content {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                        let tool_use_id = item.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let output_raw = item.get("content").map(|v| {
+                            if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else {
+                                serde_json::to_string(v).unwrap_or_default()
+                            }
+                        });
+                        let output = output_raw.map(|s| {
+                            if limit > 0 && s.chars().count() > limit {
+                                format!("{}...", s.chars().take(limit).collect::<String>())
+                            } else {
+                                s
+                            }
+                        });
+
+                        // Find matching tool call and update with result
+                        if tool_calls.contains_key(&tool_use_id) {
+                            // Find and update the existing tool entry
+                            for tool in &mut tools {
+                                if tool.id == tool_use_id && tool.output.is_none() {
+                                    tool.output = output.clone();
+                                    break;
+                                }
+                            }
+                        } else if !tool_use_id.is_empty() {
+                            // Orphan result (call was outside window)
+                            tools.push(ToolInfo {
+                                name: "?".to_string(),
+                                id: tool_use_id,
+                                input: None,
+                                output,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle Codex format - check for function_call events
+        if msg_type == "response_item" {
+            if let Some(payload) = val.get("payload") {
+                let item_type = payload.get("type").and_then(|v| v.as_str());
+                if item_type == Some("function_call") {
+                    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                    let id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let input = payload.get("arguments").and_then(|v| v.as_str()).map(|s| {
+                        if limit > 0 && s.chars().count() > limit {
+                            format!("{}...", s.chars().take(limit).collect::<String>())
+                        } else {
+                            s.to_string()
+                        }
+                    });
+                    if !id.is_empty() {
+                        tool_calls.insert(id.clone(), (name.clone(), input.clone()));
+                        tools.push(ToolInfo {
+                            name,
+                            id,
+                            input,
+                            output: None,
+                        });
+                    }
+                } else if item_type == Some("function_call_output") {
+                    let call_id = payload.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let output_raw = payload.get("output").and_then(|v| v.as_str()).map(String::from);
+                    let output = output_raw.map(|s| {
+                        if limit > 0 && s.chars().count() > limit {
+                            format!("{}...", s.chars().take(limit).collect::<String>())
+                        } else {
+                            s
+                        }
+                    });
+
+                    // Find and update matching tool
+                    for tool in &mut tools {
+                        if tool.id == call_id && tool.output.is_none() {
+                            tool.output = output.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tools
+}
+
 /// Check if a model matches any of the provided patterns.
 /// Patterns support glob-like matching:
 /// - "opus" → contains (case-insensitive)
@@ -919,6 +1098,7 @@ fn run_cli_search(
     full_model: bool,
     from: Option<String>,
     model_patterns: Vec<String>,
+    tools: Option<usize>,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -1007,14 +1187,18 @@ fn run_cli_search(
         }
     }
 
-    // Post-filter by model patterns (Tantivy doesn't have model indexed, must filter after)
-    if !model_patterns.is_empty() {
-        // Enrich hits with model from SQLite if not already present
+    // Enrich hits if we need model filtering or tools display
+    let needs_enrichment = !model_patterns.is_empty() || tools.is_some();
+    if needs_enrichment {
         for hit in &mut hits {
-            if hit.model.is_none() {
+            if hit.model.is_none() || hit.line_number.is_none() {
                 let _ = client.enrich_hit_for_context(hit);
             }
         }
+    }
+
+    // Post-filter by model patterns (Tantivy doesn't have model indexed, must filter after)
+    if !model_patterns.is_empty() {
         hits.retain(|hit| model_matches(&hit.model, &model_patterns));
     }
 
@@ -1141,6 +1325,25 @@ fn run_cli_search(
                             "{} {} {}{}{}: {}{}",
                             marker, turn.turn_index, role_display, ts_display, model_display, preview, ellipsis
                         );
+                    }
+                }
+            }
+
+            // Show tool calls/results if --tools flag is provided
+            if let Some(tools_len) = tools {
+                if let Some(line_num) = hit.line_number {
+                    let fetched_tools = fetch_tools_from_source(&hit.source_path, line_num, tools_len, hit.role.as_deref());
+                    if !fetched_tools.is_empty() {
+                        println!("\n{}Tools ({} calls):{}", dim, fetched_tools.len(), reset);
+                        for tool in &fetched_tools {
+                            let input_display = tool.input.as_ref()
+                                .map(|i| format!(" input: {}", i.replace('\n', " ")))
+                                .unwrap_or_default();
+                            let output_display = tool.output.as_ref()
+                                .map(|o| format!(" → {}", o.replace('\n', " ")))
+                                .unwrap_or_default();
+                            println!("  {}[{}]{}{}{}", dim, tool.name, reset, input_display, output_display);
+                        }
                     }
                 }
             }

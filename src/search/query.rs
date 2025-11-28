@@ -60,6 +60,9 @@ pub struct SearchHit {
     pub source_path: String,
     pub agent: String,
     pub workspace: String,
+    /// The role of this message (e.g., "user", "assistant")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// The model used for this message (e.g., "claude-sonnet-4-20250514")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -514,6 +517,7 @@ impl SearchClient {
                 source_path: source,
                 agent,
                 workspace,
+                role: None,  // Not in Tantivy index; enriched from SQLite later
                 model: None, // Not in Tantivy index; enriched from SQLite later
                 created_at,
                 line_number: None, // TODO: populate from index if stored
@@ -538,7 +542,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id, m.author
+            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id, m.author, m.role
              FROM fts_messages f
              LEFT JOIN messages m ON f.message_id = m.id
              WHERE fts_messages MATCH ?",
@@ -602,6 +606,7 @@ impl SearchClient {
                 let message_id: Option<i64> = row.get(9).ok();
                 let conversation_id: Option<i64> = row.get(10).ok();
                 let model: Option<String> = row.get(11).ok();
+                let role: Option<String> = row.get(12).ok();
                 Ok(SearchHit {
                     title,
                     snippet,
@@ -610,6 +615,7 @@ impl SearchClient {
                     source_path,
                     agent,
                     workspace,
+                    role,
                     model,
                     created_at,
                     line_number,
@@ -627,7 +633,7 @@ impl SearchClient {
         Ok(hits)
     }
 
-    /// Enrich a SearchHit with message_id and conversation_id from SQLite.
+    /// Enrich a SearchHit with message_id, conversation_id, role, and model from SQLite.
     /// This is used when Tantivy search finds results but we need context.
     pub fn enrich_hit_for_context(&self, hit: &mut SearchHit) -> Result<()> {
         let conn = self.sqlite.as_ref().ok_or_else(|| {
@@ -636,7 +642,7 @@ impl SearchClient {
 
         // Look up the message by content (first 500 chars to handle truncation)
         let content_prefix: String = hit.content.chars().take(500).collect();
-        let sql = "SELECT m.id, m.conversation_id, m.idx FROM messages m
+        let sql = "SELECT m.id, m.conversation_id, m.idx, m.role, m.author FROM messages m
                    WHERE m.content LIKE ? || '%'
                    LIMIT 1";
 
@@ -645,13 +651,21 @@ impl SearchClient {
             let id: i64 = row.get(0)?;
             let conversation_id: i64 = row.get(1)?;
             let idx: i64 = row.get(2)?;
-            Ok((id, conversation_id, idx))
+            let role: Option<String> = row.get(3).ok();
+            let author: Option<String> = row.get(4).ok();
+            Ok((id, conversation_id, idx, role, author))
         });
 
-        if let Ok((id, conv_id, idx)) = result {
+        if let Ok((id, conv_id, idx, role, author)) = result {
             hit.message_id = Some(id);
             hit.conversation_id = Some(conv_id);
             hit.line_number = Some((idx + 1) as usize);
+            if hit.role.is_none() {
+                hit.role = role;
+            }
+            if hit.model.is_none() {
+                hit.model = author;
+            }
         }
         Ok(())
     }
@@ -1066,6 +1080,7 @@ mod tests {
             source_path: "p".into(),
             agent: "a".into(),
             workspace: "w".into(),
+            role: None,
             model: None,
             created_at: None,
             line_number: None,
@@ -1093,6 +1108,7 @@ mod tests {
             source_path: "p".into(),
             agent: "a".into(),
             workspace: "w".into(),
+            role: None,
             model: None,
             created_at: None,
             line_number: None,
