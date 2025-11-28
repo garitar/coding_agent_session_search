@@ -9,3 +9,4 @@ target/
 *.swo
 /dist/
 /node_modules/
+.beads/
