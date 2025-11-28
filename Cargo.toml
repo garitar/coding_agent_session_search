@@ -46,6 +46,7 @@ semver = "*"
 tracing-appender = "*"
 strsim = "0.11.1"
 once_cell = "*"
+libc = "*"
 
 [build-dependencies]
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }

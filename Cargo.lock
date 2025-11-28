@@ -419,6 +419,7 @@ dependencies = [
  "dotenvy",
  "indicatif",
  "insta",
+ "libc",
  "lru 0.16.2",
  "notify",
  "once_cell",

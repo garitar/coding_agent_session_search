@@ -36,6 +36,9 @@ pub struct ContextTurn {
     pub content: String,
     /// The position of this turn in the conversation (0-indexed)
     pub turn_index: i64,
+    /// Timestamp of this turn (milliseconds since epoch)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
     /// Whether this is the matched turn (the search hit itself)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_match: bool,
@@ -652,7 +655,7 @@ impl SearchClient {
         let mut turns = Vec::new();
 
         // Get N turns before (and including) the match, ordered by idx DESC, then reverse
-        let sql_before = "SELECT idx, role, content FROM messages
+        let sql_before = "SELECT idx, role, content, created_at FROM messages
                           WHERE conversation_id = ? AND idx <= ?
                           ORDER BY idx DESC
                           LIMIT ?";
@@ -663,10 +666,12 @@ impl SearchClient {
                 let idx: i64 = row.get(0)?;
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
+                let created_at: Option<i64> = row.get(3).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
+                    created_at,
                     is_match: idx == match_idx,
                 })
             },
@@ -678,7 +683,7 @@ impl SearchClient {
         turns.reverse(); // Put in chronological order
 
         // Get N turns after the match
-        let sql_after = "SELECT idx, role, content FROM messages
+        let sql_after = "SELECT idx, role, content, created_at FROM messages
                          WHERE conversation_id = ? AND idx > ?
                          ORDER BY idx ASC
                          LIMIT ?";
@@ -689,10 +694,12 @@ impl SearchClient {
                 let idx: i64 = row.get(0)?;
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
+                let created_at: Option<i64> = row.get(3).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
+                    created_at,
                     is_match: false, // These are after the match
                 })
             },

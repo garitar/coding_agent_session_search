@@ -1,5 +1,13 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Reset SIGPIPE to default behavior to avoid panic on broken pipe (e.g., when piping to `less`)
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
 
