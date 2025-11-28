@@ -150,7 +150,7 @@ pub enum Commands {
         #[arg(long)]
         until: Option<String>,
         /// Include conversation turns around each hit. Can be a single number (N turns before and after)
-        /// or "before,after" for asymmetric context (e.g., "3,5" = 3 before, 5 after)
+        /// or "before:after" for asymmetric context (e.g., "2:5" = 2 before, 5 after)
         #[arg(long, short = 'T')]
         turns: Option<String>,
     },
@@ -644,7 +644,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --days N          Filter to last N days".to_string(),
             "    --since DATE      Filter from date (YYYY-MM-DD)".to_string(),
             "    --until DATE      Filter to date (YYYY-MM-DD)".to_string(),
-            "    --turns N / -T N  Include N turns before/after each hit (or \"B,A\" for asymmetric)".to_string(),
+            "    --turns N / -T N  Include N turns before/after each hit (or \"B:A\" for asymmetric)".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--data-dir DIR]".to_string(),
@@ -904,10 +904,10 @@ fn run_cli_search(
         })?;
 
     // Fetch surrounding turns if requested
-    // Parse turns as either "N" (symmetric) or "before,after" (asymmetric)
+    // Parse turns as either "N" (symmetric) or "before:after" (asymmetric)
     if let Some(turns_str) = turns {
-        let (turns_before, turns_after) = if turns_str.contains(',') {
-            let parts: Vec<&str> = turns_str.split(',').collect();
+        let (turns_before, turns_after) = if turns_str.contains(':') {
+            let parts: Vec<&str> = turns_str.split(':').collect();
             if parts.len() == 2 {
                 let before = parts[0].trim().parse::<usize>().unwrap_or(2);
                 let after = parts[1].trim().parse::<usize>().unwrap_or(2);
