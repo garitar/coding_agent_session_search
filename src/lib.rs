@@ -158,6 +158,9 @@ pub enum Commands {
         /// Hide main content/snippet, show only context turns (use with -T)
         #[arg(long)]
         no_content: bool,
+        /// Show model on each turn (by default only shown in headline)
+        #[arg(long)]
+        full_model: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -460,6 +463,7 @@ async fn execute_cli(
                     turns,
                     snippet_len,
                     no_content,
+                    full_model,
                 } => {
                     run_cli_search(
                         &query,
@@ -483,6 +487,7 @@ async fn execute_cli(
                         turns,
                         snippet_len,
                         no_content,
+                        full_model,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -860,6 +865,7 @@ fn run_cli_search(
     turns: Option<String>,
     snippet_len: usize,
     no_content: bool,
+    full_model: bool,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -996,8 +1002,12 @@ fn run_cli_search(
         for (i, hit) in hits.iter().enumerate() {
             // Better separator with hit number
             println!("{}═══════════════════════════════════════════════════════════════════{}", dim, reset);
-            println!("{}[{}/{}]{} Score: {:.2} | Agent: {} | WS: {}",
-                bold, i + 1, hits.len(), reset, hit.score, hit.agent, hit.workspace
+            // Build headline with optional model (in parentheses after agent, dimmed)
+            let model_str = hit.model.as_ref()
+                .map(|m| format!(" {}({}){}", dim, m, reset))
+                .unwrap_or_default();
+            println!("{}[{}/{}]{} Score: {:.2} | {}{} | WS: {}",
+                bold, i + 1, hits.len(), reset, hit.score, hit.agent, model_str, hit.workspace
             );
             println!("Path: {}", hit.source_path);
 
@@ -1037,24 +1047,33 @@ fn run_cli_search(
                         .map(|dt| format!(" {}{}{}", dim, dt.format("%H:%M:%S"), reset))
                         .unwrap_or_default();
 
+                    // Format model if --full-model and available
+                    let model_display = if full_model {
+                        turn.model.as_ref()
+                            .map(|m| format!(" {}[{}]{}", dim, m, reset))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
                     // Full content: preserve newlines with indent; preview: collapse to single line
                     if snippet_len == 0 {
                         let lines: Vec<&str> = turn.content.lines().collect();
                         if let Some((first, rest)) = lines.split_first() {
-                            println!("{} {} {}{}: {}", marker, turn.turn_index, role_display, ts_display, first);
+                            println!("{} {} {}{}{}: {}", marker, turn.turn_index, role_display, ts_display, model_display, first);
                             for line in rest {
                                 println!("       {}", line);
                             }
                         } else {
-                            println!("{} {} {}{}: ", marker, turn.turn_index, role_display, ts_display);
+                            println!("{} {} {}{}{}: ", marker, turn.turn_index, role_display, ts_display, model_display);
                         }
                     } else {
                         let content_clean = turn.content.replace('\n', " ");
                         let preview: String = content_clean.chars().take(snippet_len).collect();
                         let ellipsis = if turn.content.chars().count() > snippet_len { "..." } else { "" };
                         println!(
-                            "{} {} {}{}: {}{}",
-                            marker, turn.turn_index, role_display, ts_display, preview, ellipsis
+                            "{} {} {}{}{}: {}{}",
+                            marker, turn.turn_index, role_display, ts_display, model_display, preview, ellipsis
                         );
                     }
                 }

@@ -39,6 +39,9 @@ pub struct ContextTurn {
     /// Timestamp of this turn (milliseconds since epoch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    /// The model used for this turn (e.g., "claude-sonnet-4-20250514")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Whether this is the matched turn (the search hit itself)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_match: bool,
@@ -53,6 +56,9 @@ pub struct SearchHit {
     pub source_path: String,
     pub agent: String,
     pub workspace: String,
+    /// The model used for this message (e.g., "claude-sonnet-4-20250514")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
     pub line_number: Option<usize>,
@@ -504,6 +510,7 @@ impl SearchClient {
                 source_path: source,
                 agent,
                 workspace,
+                model: None, // Not in Tantivy index; enriched from SQLite later
                 created_at,
                 line_number: None, // TODO: populate from index if stored
                 message_id: None,  // Not available from Tantivy index
@@ -527,7 +534,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id
+            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id, m.author
              FROM fts_messages f
              LEFT JOIN messages m ON f.message_id = m.id
              WHERE fts_messages MATCH ?",
@@ -586,6 +593,7 @@ impl SearchClient {
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let message_id: Option<i64> = row.get(9).ok();
                 let conversation_id: Option<i64> = row.get(10).ok();
+                let model: Option<String> = row.get(11).ok();
                 Ok(SearchHit {
                     title,
                     snippet,
@@ -594,6 +602,7 @@ impl SearchClient {
                     source_path,
                     agent,
                     workspace,
+                    model,
                     created_at,
                     line_number,
                     message_id,
@@ -655,7 +664,7 @@ impl SearchClient {
         let mut turns = Vec::new();
 
         // Get N turns before (and including) the match, ordered by idx DESC, then reverse
-        let sql_before = "SELECT idx, role, content, created_at FROM messages
+        let sql_before = "SELECT idx, role, content, created_at, author FROM messages
                           WHERE conversation_id = ? AND idx <= ?
                           ORDER BY idx DESC
                           LIMIT ?";
@@ -667,11 +676,13 @@ impl SearchClient {
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
                 let created_at: Option<i64> = row.get(3).ok();
+                let model: Option<String> = row.get(4).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
                     created_at,
+                    model,
                     is_match: idx == match_idx,
                 })
             },
@@ -683,7 +694,7 @@ impl SearchClient {
         turns.reverse(); // Put in chronological order
 
         // Get N turns after the match
-        let sql_after = "SELECT idx, role, content, created_at FROM messages
+        let sql_after = "SELECT idx, role, content, created_at, author FROM messages
                          WHERE conversation_id = ? AND idx > ?
                          ORDER BY idx ASC
                          LIMIT ?";
@@ -695,11 +706,13 @@ impl SearchClient {
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
                 let created_at: Option<i64> = row.get(3).ok();
+                let model: Option<String> = row.get(4).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
                     created_at,
+                    model,
                     is_match: false, // These are after the match
                 })
             },
@@ -1045,6 +1058,7 @@ mod tests {
             source_path: "p".into(),
             agent: "a".into(),
             workspace: "w".into(),
+            model: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1071,6 +1085,7 @@ mod tests {
             source_path: "p".into(),
             agent: "a".into(),
             workspace: "w".into(),
+            model: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1498,6 +1513,7 @@ mod tests {
             content: "Hello world".to_string(),
             turn_index: 0,
             created_at: Some(1700000000000), // Nov 14, 2023
+            model: None,
             is_match: true,
         };
         assert_eq!(turn.created_at, Some(1700000000000));
@@ -1516,10 +1532,12 @@ mod tests {
             content: "Hi there".to_string(),
             turn_index: 1,
             created_at: None,
+            model: None,
             is_match: false,
         };
         let json = serde_json::to_string(&turn).unwrap();
         assert!(!json.contains("created_at"));
         assert!(!json.contains("is_match")); // Also skipped when false
+        assert!(!json.contains("model")); // Also skipped when None
     }
 }
