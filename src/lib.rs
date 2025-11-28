@@ -1154,18 +1154,96 @@ fn run_cli_search(
     }
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
-    filters.role = from;
+    filters.role = from.clone();
     filters.models = model_patterns.clone();
 
-    let mut hits = client
-        .search(query, filters, *limit, *offset)
-        .map_err(|e| CliError {
-            code: 9,
-            kind: "search",
-            message: format!("search failed: {e}"),
-            hint: None,
-            retryable: true,
-        })?;
+    // Determine if we need post-filtering (which may reduce result count below limit)
+    let needs_post_filter = from.is_some()
+        || !model_patterns.is_empty()
+        || !include_summaries
+        || !include_autocontext;
+
+    // Helper closure to apply all post-filters to a hit
+    let passes_filters = |hit: &crate::search::query::SearchHit| -> bool {
+        // Model filter
+        if !model_patterns.is_empty() {
+            if !model_matches(&hit.model, &model_patterns) {
+                return false;
+            }
+        }
+        // Summary filter
+        if !include_summaries {
+            if hit.content.contains("This session is being continued from a previous conversation")
+                || hit.content.contains("conversation is summarized below")
+                || hit.content.contains("context compaction")
+            {
+                return false;
+            }
+        }
+        // Autocontext filter
+        if !include_autocontext {
+            if hit.content.starts_with("# Context from my IDE setup")
+                || hit.content.contains("\n# Context from my IDE setup")
+            {
+                return false;
+            }
+        }
+        true
+    };
+
+    // Fetch results, looping to get more if post-filtering reduces count below limit.
+    // We implement offset via the limit cursor: fetch (offset + limit) filtered results,
+    // then skip the first `offset`. This makes offset semantically correct with post-filtering.
+    let target_count = *offset + *limit;
+    let mut hits = Vec::new();
+    let mut raw_offset = 0usize;
+    let batch_size = if needs_post_filter { target_count.max(50) } else { target_count };
+    let max_iterations = 20; // Safety limit to avoid infinite loops
+
+    for _ in 0..max_iterations {
+        let batch = client
+            .search(query, filters.clone(), batch_size, raw_offset)
+            .map_err(|e| CliError {
+                code: 9,
+                kind: "search",
+                message: format!("search failed: {e}"),
+                hint: None,
+                retryable: true,
+            })?;
+
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            break; // No more results available
+        }
+
+        for mut hit in batch {
+            // Enrich Tantivy hits with role/model from SQLite (needed for filtering)
+            if hit.role.is_none() || hit.model.is_none() || hit.line_number.is_none() {
+                let _ = client.enrich_hit_for_context(&mut hit);
+            }
+
+            if passes_filters(&hit) {
+                hits.push(hit);
+                if hits.len() >= target_count {
+                    break;
+                }
+            }
+        }
+
+        if hits.len() >= target_count {
+            break; // Got enough results
+        }
+
+        raw_offset += batch_len;
+
+        // If batch was smaller than requested, we've exhausted results
+        if batch_len < batch_size {
+            break;
+        }
+    }
+
+    // Apply offset: skip first `offset` filtered results, keep up to `limit`
+    let mut hits: Vec<_> = hits.into_iter().skip(*offset).take(*limit).collect();
 
     // Fetch surrounding turns if requested
     // Parse turns as either "N" (symmetric) or "before:after" (asymmetric)
@@ -1199,36 +1277,13 @@ fn run_cli_search(
         }
     }
 
-    // Enrich hits if we need model filtering or tools display
-    let needs_enrichment = !model_patterns.is_empty() || tools.is_some();
-    if needs_enrichment {
+    // Additional enrichment for tools display
+    if tools.is_some() {
         for hit in &mut hits {
-            if hit.model.is_none() || hit.line_number.is_none() {
+            if hit.line_number.is_none() {
                 let _ = client.enrich_hit_for_context(hit);
             }
         }
-    }
-
-    // Post-filter by model patterns (Tantivy doesn't have model indexed, must filter after)
-    if !model_patterns.is_empty() {
-        hits.retain(|hit| model_matches(&hit.model, &model_patterns));
-    }
-
-    // Filter out summary/continuation messages unless explicitly included
-    if !include_summaries {
-        hits.retain(|hit| {
-            !hit.content.contains("This session is being continued from a previous conversation")
-                && !hit.content.contains("conversation is summarized below")
-                && !hit.content.contains("context compaction")
-        });
-    }
-
-    // Filter out IDE autocontext messages unless explicitly included
-    if !include_autocontext {
-        hits.retain(|hit| {
-            !hit.content.starts_with("# Context from my IDE setup")
-                && !hit.content.contains("\n# Context from my IDE setup")
-        });
     }
 
     if *json {
