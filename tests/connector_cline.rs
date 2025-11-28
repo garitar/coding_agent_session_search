@@ -14,6 +14,8 @@ fn cline_parses_fixture_task() {
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
     assert_eq!(c.title.as_deref(), Some("Cline fixture task"));
-    assert_eq!(c.messages.len(), 3);
-    assert!(c.messages.iter().any(|m| m.content.contains("API reply")));
+    // We now prefer ui_messages.json (2 msgs) over api_conversation_history.json (1 msg)
+    // to avoid duplicates and prefer user-facing content.
+    assert_eq!(c.messages.len(), 2);
+    assert!(c.messages.iter().any(|m| m.content.contains("Hello Cline")));
 }

@@ -169,6 +169,18 @@ impl SqliteStorage {
         Ok(Self { conn })
     }
 
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
+
+        apply_common_pragmas(&conn)?;
+
+        Ok(Self { conn })
+    }
+
     pub fn raw(&self) -> &Connection {
         &self.conn
     }
@@ -433,6 +445,14 @@ fn apply_pragmas(conn: &mut Connection) -> Result<()> {
         r#"
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
+        "#,
+    )?;
+    apply_common_pragmas(conn)
+}
+
+fn apply_common_pragmas(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
         PRAGMA temp_store = MEMORY;
         PRAGMA cache_size = -65536; -- 64MB
         PRAGMA mmap_size = 268435456; -- 256MB

@@ -20,10 +20,9 @@ pub struct ConversationView {
 }
 
 pub fn load_conversation(
-    db_path: &std::path::Path,
+    storage: &SqliteStorage,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
-    let storage = SqliteStorage::open(db_path)?;
     let mut stmt = storage.raw().prepare(
         "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path, c.started_at, c.ended_at, c.approx_tokens, c.metadata_json
          FROM conversations c

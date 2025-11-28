@@ -305,6 +305,11 @@ fn reindex_paths(
 
         tracing::info!(?kind, conversations = convs.len(), since_ts, "watch_scan");
         ingest_batch(&mut storage, &mut t_index, &convs, &opts.progress)?;
+
+        // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
+        // This prevents a state where we think we've indexed up to T, but the index is stale.
+        t_index.commit()?;
+
         if let Some(ts_val) = ts {
             let mut guard = state.lock().unwrap();
             let entry = guard.entry(kind).or_insert(ts_val);
@@ -312,7 +317,6 @@ fn reindex_paths(
             save_watch_state(&opts.data_dir, &guard)?;
         }
     }
-    t_index.commit()?;
 
     // Reset phase to idle if progress exists
     if let Some(p) = &opts.progress {

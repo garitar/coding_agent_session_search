@@ -877,18 +877,21 @@ fn is_prefix_only(query: &str) -> bool {
 fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String {
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
+    let content_char_count = content.chars().count();
     if let Some(pos) = lc_content.find(&lc_query) {
         // convert byte index to char index
         let start_char = content[..pos].chars().count().saturating_sub(15);
         let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        if snippet.len() < content.len() {
+        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
+        let snippet_char_count = snippet.chars().count();
+        if start_char + snippet_char_count < content_char_count {
             format!("{snippet}…")
         } else {
             snippet
         }
     } else {
         let snippet: String = content.chars().take(max_chars).collect();
-        if content.chars().count() > max_chars {
+        if content_char_count > max_chars {
             format!("{snippet}…")
         } else {
             snippet
@@ -902,10 +905,13 @@ fn cached_prefix_snippet(content: &str, query: &str, max_chars: usize) -> Option
     }
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
+    let content_char_count = content.chars().count();
     lc_content.find(&lc_query).map(|pos| {
         let start_char = content[..pos].chars().count().saturating_sub(15);
         let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        if snippet.len() < content.len() {
+        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
+        let snippet_char_count = snippet.chars().count();
+        if start_char + snippet_char_count < content_char_count {
             format!("{snippet}…")
         } else {
             snippet

@@ -1,10 +1,10 @@
 [package]
 name = "coding-agent-search"
-version = "0.1.24"
+version = "0.1.27"
 edition = "2024"
-authors = ["Coding Agent Team"]
+authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 resolver = "2"
 repository = "https://github.com/Dicklesworthstone/coding_agent_session_search"
 default-run = "cass"

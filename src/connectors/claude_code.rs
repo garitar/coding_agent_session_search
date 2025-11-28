@@ -80,9 +80,11 @@ impl Connector for ClaudeCodeConnector {
             let mut ended_at = None;
             // Track workspace from first entry's cwd field
             let mut workspace: Option<PathBuf> = None;
+            let mut session_id: Option<String> = None;
+            let mut git_branch: Option<String> = None;
 
             if ext == Some("jsonl") {
-                for (idx, line) in content.lines().enumerate() {
+                for line in content.lines() {
                     if line.trim().is_empty() {
                         continue;
                     }
@@ -91,9 +93,21 @@ impl Connector for ClaudeCodeConnector {
                         Err(_) => continue, // Skip malformed lines
                     };
 
-                    // Extract workspace from first entry with cwd field
+                    // Extract session metadata from first available entry
                     if workspace.is_none() {
                         workspace = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+                    }
+                    if session_id.is_none() {
+                        session_id = val
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                    }
+                    if git_branch.is_none() {
+                        git_branch = val
+                            .get("gitBranch")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                     }
 
                     // Filter to user/assistant entries only (skip summary, file-history-snapshot, etc.)
@@ -106,6 +120,13 @@ impl Connector for ClaudeCodeConnector {
                     let created = val
                         .get("timestamp")
                         .and_then(crate::connectors::parse_timestamp);
+
+                    if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                        && ts <= since
+                    {
+                        continue;
+                    }
+
                     started_at = started_at.or(created);
                     ended_at = created.or(ended_at);
 
@@ -136,7 +157,7 @@ impl Connector for ClaudeCodeConnector {
                         .map(String::from);
 
                     messages.push(NormalizedMessage {
-                        idx: idx as i64,
+                        idx: 0, // will be re-assigned after filtering
                         role: role.to_string(),
                         author,
                         created_at: created,
@@ -145,11 +166,15 @@ impl Connector for ClaudeCodeConnector {
                         snippets: Vec::new(),
                     });
                 }
+                // Re-assign sequential indices after filtering
+                for (i, msg) in messages.iter_mut().enumerate() {
+                    msg.idx = i as i64;
+                }
             } else {
                 // JSON or Claude format files
                 let val: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
                 if let Some(arr) = val.get("messages").and_then(|m| m.as_array()) {
-                    for (idx, item) in arr.iter().enumerate() {
+                    for item in arr.iter() {
                         let role = item
                             .get("role")
                             .or_else(|| item.get("type"))
@@ -161,6 +186,13 @@ impl Connector for ClaudeCodeConnector {
                             .get("timestamp")
                             .or_else(|| item.get("time"))
                             .and_then(crate::connectors::parse_timestamp);
+
+                        if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                            && ts <= since
+                        {
+                            continue;
+                        }
+
                         started_at = started_at.or(created);
                         ended_at = created.or(ended_at);
 
@@ -177,7 +209,7 @@ impl Connector for ClaudeCodeConnector {
                         }
 
                         messages.push(NormalizedMessage {
-                            idx: idx as i64,
+                            idx: 0, // will be re-assigned after filtering
                             role: role.to_string(),
                             author: None,
                             created_at: created,
@@ -186,6 +218,10 @@ impl Connector for ClaudeCodeConnector {
                             snippets: Vec::new(),
                         });
                     }
+                }
+                // Re-assign sequential indices after filtering
+                for (i, msg) in messages.iter_mut().enumerate() {
+                    msg.idx = i as i64;
                 }
             }
             if messages.is_empty() {
@@ -246,7 +282,11 @@ impl Connector for ClaudeCodeConnector {
                 source_path: entry.path().to_path_buf(),
                 started_at,
                 ended_at,
-                metadata: serde_json::json!({"source": "claude_code"}),
+                metadata: serde_json::json!({
+                    "source": "claude_code",
+                    "sessionId": session_id,
+                    "gitBranch": git_branch
+                }),
                 messages,
             });
         }

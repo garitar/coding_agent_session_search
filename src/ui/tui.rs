@@ -116,25 +116,41 @@ fn score_style(score: f32) -> Modifier {
     }
 }
 
-/// Creates a visual bar representation of score: `████░░ 8.2`
-/// Uses 5-character bar with filled/empty blocks proportional to score (0-10 scale).
-fn score_bar(score: f32, color: ratatui::style::Color) -> Vec<Span<'static>> {
+/// Creates a refined visual score indicator: `●●●●○ 8.2`
+/// Uses 5 dots proportional to score (0-10 scale) with premium styling.
+fn score_bar(score: f32, palette: ThemePalette) -> Vec<Span<'static>> {
+    use crate::ui::components::theme::colors;
+
     let normalized = (score / 10.0).clamp(0.0, 1.0);
     let filled = (normalized * 5.0).round() as usize;
     let empty = 5 - filled;
+
+    // Premium color based on score tier
+    let color = if score >= 8.0 {
+        colors::STATUS_SUCCESS
+    } else if score >= 5.0 {
+        palette.accent
+    } else {
+        palette.hint
+    };
+
+    let modifier = score_style(score);
+
     vec![
         Span::styled(
-            "█".repeat(filled),
-            Style::default().fg(color).add_modifier(score_style(score)),
+            "●".repeat(filled),
+            Style::default().fg(color).add_modifier(modifier),
         ),
         Span::styled(
-            "░".repeat(empty),
-            Style::default().fg(color).add_modifier(Modifier::DIM),
+            "○".repeat(empty),
+            Style::default()
+                .fg(palette.hint)
+                .add_modifier(Modifier::DIM),
         ),
         Span::raw(" "),
         Span::styled(
             format!("{:.1}", score),
-            Style::default().fg(color).add_modifier(score_style(score)),
+            Style::default().fg(color).add_modifier(modifier),
         ),
     ]
 }
@@ -1504,6 +1520,10 @@ pub fn run_tui(
     let state_path = state_path_for(&data_dir);
     let persisted = load_state(&state_path);
     let search_client = SearchClient::open(&index_path, Some(&db_path))?;
+    // Open a read-only connection for the UI to fetch details efficiently.
+    // If DB doesn't exist yet (first run), this will be None, which is fine as we can't view details anyway.
+    let db_reader = crate::storage::sqlite::SqliteStorage::open_readonly(&db_path).ok();
+
     let index_ready = search_client.is_some();
     let mut status = if index_ready {
         format!(
@@ -1759,7 +1779,7 @@ pub fn run_tui(
                                     hit.title.as_str()
                                 };
                                 // Build header with score bar visualization
-                                let mut header_spans = score_bar(hit.score, theme.accent);
+                                let mut header_spans = score_bar(hit.score, palette);
                                 header_spans.push(Span::raw(" "));
                                 header_spans.push(Span::styled(
                                     title.to_string(),
@@ -1926,7 +1946,11 @@ pub fn run_tui(
                     {
                         cached_detail.as_ref().map(|(_, d)| d.clone())
                     } else {
-                        let loaded = load_conversation(&db_path, &hit.source_path).ok().flatten();
+                        let loaded = if let Some(storage) = &db_reader {
+                            load_conversation(storage, &hit.source_path).ok().flatten()
+                        } else {
+                            None
+                        };
                         if let Some(d) = &loaded {
                             cached_detail = Some((hit.source_path.clone(), d.clone()));
                             // Reset scroll when loading new conversation

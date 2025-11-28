@@ -1,4 +1,3 @@
-pub mod config;
 pub mod connectors;
 pub mod indexer;
 pub mod model;
