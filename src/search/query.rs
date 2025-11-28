@@ -1489,4 +1489,37 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn context_turn_has_created_at_field() {
+        // Verify ContextTurn struct includes created_at for timestamp display
+        let turn = ContextTurn {
+            role: "user".to_string(),
+            content: "Hello world".to_string(),
+            turn_index: 0,
+            created_at: Some(1700000000000), // Nov 14, 2023
+            is_match: true,
+        };
+        assert_eq!(turn.created_at, Some(1700000000000));
+
+        // Verify it serializes correctly
+        let json = serde_json::to_string(&turn).unwrap();
+        assert!(json.contains("created_at"));
+        assert!(json.contains("1700000000000"));
+    }
+
+    #[test]
+    fn context_turn_skips_none_created_at_in_json() {
+        // Verify skip_serializing_if works for None
+        let turn = ContextTurn {
+            role: "assistant".to_string(),
+            content: "Hi there".to_string(),
+            turn_index: 1,
+            created_at: None,
+            is_match: false,
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        assert!(!json.contains("created_at"));
+        assert!(!json.contains("is_match")); // Also skipped when false
+    }
 }
