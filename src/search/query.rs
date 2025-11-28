@@ -27,6 +27,8 @@ pub struct SearchFilters {
     pub created_to: Option<i64>,
     /// Filter by message role (e.g., "user", "assistant")
     pub role: Option<String>,
+    /// Filter by model name (supports glob patterns: "opus" → contains, "gpt-5*" → prefix, "*opus" → suffix, "\"exact\"" → exact)
+    pub models: Vec<String>,
 }
 
 /// A conversation turn included as context around a search hit

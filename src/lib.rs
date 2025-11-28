@@ -164,6 +164,11 @@ pub enum Commands {
         /// Filter by message role (user or assistant)
         #[arg(long)]
         from: Option<String>,
+        /// Filter by model name (can be specified multiple times).
+        /// Supports glob patterns: "opus" matches contains, "gpt*" matches prefix,
+        /// "*opus" matches suffix, "\"exact\"" matches exactly.
+        #[arg(long)]
+        model: Vec<String>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -468,6 +473,7 @@ async fn execute_cli(
                     no_content,
                     full_model,
                     from,
+                    model,
                 } => {
                     run_cli_search(
                         &query,
@@ -493,6 +499,7 @@ async fn execute_cli(
                         no_content,
                         full_model,
                         from,
+                        model,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -854,6 +861,45 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     None
 }
 
+/// Check if a model matches any of the provided patterns.
+/// Patterns support glob-like matching:
+/// - "opus" → contains (case-insensitive)
+/// - "gpt*" → prefix match
+/// - "*opus" → suffix match
+/// - "*claude*" → contains (explicit)
+/// - "\"exact\"" → exact match (quoted)
+fn model_matches(model: &Option<String>, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Some(model) = model else {
+        return false;
+    };
+    let model_lower = model.to_lowercase();
+    patterns.iter().any(|pattern| {
+        let trimmed = pattern.trim();
+        // Exact match: quoted string
+        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 2 {
+            let exact = &trimmed[1..trimmed.len() - 1];
+            return model_lower == exact.to_lowercase();
+        }
+        let has_prefix_glob = trimmed.starts_with('*');
+        let has_suffix_glob = trimmed.ends_with('*');
+        if has_prefix_glob || has_suffix_glob {
+            let inner = trimmed.trim_matches('*').to_lowercase();
+            match (has_prefix_glob, has_suffix_glob) {
+                (true, true) => model_lower.contains(&inner),
+                (true, false) => model_lower.ends_with(&inner),
+                (false, true) => model_lower.starts_with(&inner),
+                _ => unreachable!(),
+            }
+        } else {
+            // Default: contains match
+            model_lower.contains(&trimmed.to_lowercase())
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -872,6 +918,7 @@ fn run_cli_search(
     no_content: bool,
     full_model: bool,
     from: Option<String>,
+    model_patterns: Vec<String>,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -916,6 +963,7 @@ fn run_cli_search(
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
     filters.role = from;
+    filters.models = model_patterns.clone();
 
     let mut hits = client
         .search(query, filters, *limit, *offset)
@@ -957,6 +1005,17 @@ fn run_cli_search(
                 }
             }
         }
+    }
+
+    // Post-filter by model patterns (Tantivy doesn't have model indexed, must filter after)
+    if !model_patterns.is_empty() {
+        // Enrich hits with model from SQLite if not already present
+        for hit in &mut hits {
+            if hit.model.is_none() {
+                let _ = client.enrich_hit_for_context(hit);
+            }
+        }
+        hits.retain(|hit| model_matches(&hit.model, &model_patterns));
     }
 
     if *json {
@@ -1543,5 +1602,72 @@ fn run_self_update(tag: &str) -> Result<bool> {
     } else {
         warn!(target: "update", "installer returned non-zero status: {status:?}");
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_matches_contains_pattern() {
+        // Default pattern without globs is a case-insensitive contains match
+        assert!(model_matches(&Some("claude-sonnet-4-20250514".to_string()), &["sonnet".to_string()]));
+        assert!(model_matches(&Some("claude-sonnet-4-20250514".to_string()), &["SONNET".to_string()]));
+        assert!(model_matches(&Some("gpt-4o-mini".to_string()), &["4o".to_string()]));
+        assert!(!model_matches(&Some("claude-opus-4".to_string()), &["sonnet".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_prefix_glob() {
+        // Pattern ending with * is a prefix match
+        assert!(model_matches(&Some("gpt-4o-mini".to_string()), &["gpt*".to_string()]));
+        assert!(model_matches(&Some("gpt-4".to_string()), &["gpt*".to_string()]));
+        assert!(!model_matches(&Some("claude-opus".to_string()), &["gpt*".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_suffix_glob() {
+        // Pattern starting with * is a suffix match
+        assert!(model_matches(&Some("claude-opus-4".to_string()), &["*opus-4".to_string()]));
+        assert!(model_matches(&Some("claude-sonnet-4-20250514".to_string()), &["*20250514".to_string()]));
+        assert!(!model_matches(&Some("gpt-4o".to_string()), &["*opus".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_both_globs() {
+        // Pattern with * on both sides is a contains match (explicit)
+        assert!(model_matches(&Some("claude-sonnet-4-20250514".to_string()), &["*sonnet*".to_string()]));
+        assert!(model_matches(&Some("claude-opus-4".to_string()), &["*opus*".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_exact_quoted() {
+        // Quoted pattern is an exact case-insensitive match
+        assert!(model_matches(&Some("claude-opus-4".to_string()), &["\"claude-opus-4\"".to_string()]));
+        assert!(model_matches(&Some("Claude-Opus-4".to_string()), &["\"claude-opus-4\"".to_string()]));
+        assert!(!model_matches(&Some("claude-opus-4-beta".to_string()), &["\"claude-opus-4\"".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_empty_patterns() {
+        // Empty patterns list matches everything
+        assert!(model_matches(&Some("anything".to_string()), &[]));
+        assert!(model_matches(&None, &[]));
+    }
+
+    #[test]
+    fn model_matches_none_model() {
+        // None model doesn't match any pattern (except empty list)
+        assert!(!model_matches(&None, &["opus".to_string()]));
+        assert!(!model_matches(&None, &["*".to_string()]));
+    }
+
+    #[test]
+    fn model_matches_multiple_patterns() {
+        // Any pattern match is sufficient (OR logic)
+        assert!(model_matches(&Some("claude-opus-4".to_string()), &["sonnet".to_string(), "opus".to_string()]));
+        assert!(model_matches(&Some("gpt-4o".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
+        assert!(!model_matches(&Some("gemini-pro".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
     }
 }
