@@ -73,12 +73,18 @@ fn codex_connector_includes_agent_reasoning() {
     // (token_count is filtered out)
     assert_eq!(c.messages.len(), 3);
 
-    // Check reasoning is included with correct author tag
+    // Check reasoning is included - find by payload type in extra field
     let reasoning = c
         .messages
         .iter()
-        .find(|m| m.author.as_deref() == Some("reasoning"));
-    assert!(reasoning.is_some());
+        .find(|m| {
+            m.extra
+                .get("payload")
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("agent_reasoning")
+        });
+    assert!(reasoning.is_some(), "should include agent_reasoning message");
     assert!(
         reasoning
             .unwrap()
