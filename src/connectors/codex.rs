@@ -147,10 +147,20 @@ impl Connector for CodexConnector {
                         "response_item" => {
                             // Main message entries with nested payload
                             if let Some(payload) = val.get("payload") {
+                                let payload_type = payload.get("type").and_then(|v| v.as_str());
+
+                                // Determine role: explicit role, or infer from payload type
                                 let role = payload
                                     .get("role")
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("agent");
+                                    .unwrap_or_else(|| {
+                                        // Infer role from payload type for messages without explicit role
+                                        match payload_type {
+                                            Some("reasoning") => "assistant",
+                                            Some("message") => "assistant", // default messages to assistant
+                                            _ => "assistant", // tool calls etc default to assistant
+                                        }
+                                    });
 
                                 let content_str = payload
                                     .get("content")
