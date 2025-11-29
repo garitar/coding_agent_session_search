@@ -1215,6 +1215,12 @@ fn run_cli_search(
 
     // Helper closure to apply all post-filters to a hit
     let passes_filters = |hit: &crate::search::query::SearchHit| -> bool {
+        // Role filter (--from user/assistant)
+        if let Some(ref role_filter) = from {
+            if hit.role.as_ref() != Some(role_filter) {
+                return false;
+            }
+        }
         // Model filter
         if !model_patterns.is_empty() {
             if !model_matches(&hit.model, &model_patterns) {
