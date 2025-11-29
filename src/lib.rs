@@ -1467,22 +1467,123 @@ fn run_cli_search(
                 if let Some(line_num) = hit.line_number {
                     let fetched_tools = fetch_tools_from_source(&hit.source_path, line_num, tools_len, hit.role.as_deref());
                     if !fetched_tools.is_empty() {
-                        println!("\n{}Tools ({} calls):{}", dim, fetched_tools.len(), reset);
-                        for tool in &fetched_tools {
-                            // Multi-line format matching original design
-                            println!("  {}[{}]{}", dim, tool.name, reset);
-                            if let Some(ref input) = tool.input {
-                                println!("  input:");
-                                // Indent each line of input
-                                for line in input.lines() {
-                                    println!("    {}", line);
+                        // JSON syntax highlighting colors
+                        let key_color = "\x1b[34m";    // Blue for keys
+                        let str_color = "\x1b[32m";    // Green for strings
+                        let num_color = "\x1b[36m";    // Cyan for numbers
+                        let bool_color = "\x1b[33m";   // Yellow for bool/null
+
+                        // Colorize a JSON line (simple regex-free approach)
+                        let colorize_json_line = |line: &str| -> String {
+                            let mut result = String::new();
+                            let mut chars = line.chars().peekable();
+                            let mut in_string = false;
+                            let mut is_key = false;
+                            let mut current_token = String::new();
+                            let mut escaped = false;
+
+                            while let Some(c) = chars.next() {
+                                if escaped {
+                                    current_token.push(c);
+                                    escaped = false;
+                                    continue;
+                                }
+                                match c {
+                                    '\\' if in_string => {
+                                        current_token.push(c);
+                                        escaped = true;
+                                    }
+                                    '"' if !in_string => {
+                                        in_string = true;
+                                        is_key = result.trim_end().ends_with('{')
+                                            || result.trim_end().ends_with(',')
+                                            || result.trim_end().is_empty()
+                                            || result.ends_with('\n');
+                                        current_token.push(c);
+                                    }
+                                    '"' if in_string => {
+                                        current_token.push(c);
+                                        let color = if is_key { key_color } else { str_color };
+                                        result.push_str(&format!("{}{}{}", color, current_token, reset));
+                                        current_token.clear();
+                                        in_string = false;
+                                    }
+                                    _ if in_string => {
+                                        current_token.push(c);
+                                    }
+                                    _ => {
+                                        // Check for numbers, booleans, null
+                                        if c.is_ascii_digit() || (c == '-' && chars.peek().map(|&n| n.is_ascii_digit()).unwrap_or(false)) {
+                                            current_token.push(c);
+                                            while let Some(&next) = chars.peek() {
+                                                if next.is_ascii_digit() || next == '.' || next == 'e' || next == 'E' || next == '+' || next == '-' {
+                                                    current_token.push(chars.next().unwrap());
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            result.push_str(&format!("{}{}{}", num_color, current_token, reset));
+                                            current_token.clear();
+                                        } else if c == 't' || c == 'f' || c == 'n' {
+                                            current_token.push(c);
+                                            while let Some(&next) = chars.peek() {
+                                                if next.is_ascii_alphabetic() {
+                                                    current_token.push(chars.next().unwrap());
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            if current_token == "true" || current_token == "false" || current_token == "null" {
+                                                result.push_str(&format!("{}{}{}", bool_color, current_token, reset));
+                                            } else {
+                                                result.push_str(&current_token);
+                                            }
+                                            current_token.clear();
+                                        } else {
+                                            result.push(c);
+                                        }
+                                    }
                                 }
                             }
+                            result.push_str(&current_token);
+                            result
+                        };
+
+                        println!("\n{}Tools ({} calls):{}", dim, fetched_tools.len(), reset);
+                        for tool in &fetched_tools {
+                            // Tool name header
+                            println!("  {}[{}]{}", dim, tool.name, reset);
+                            // Input on separate lines (pretty-print JSON with colors)
+                            if let Some(ref input) = tool.input {
+                                println!("    {}input:{}", dim, reset);
+                                // Try to prettify JSON, fall back to raw if parsing fails (e.g., truncated)
+                                let prettified = serde_json::from_str::<serde_json::Value>(input)
+                                    .ok()
+                                    .and_then(|v| serde_json::to_string_pretty(&v).ok());
+                                let display_input = prettified.as_ref().unwrap_or(input);
+                                for line in display_input.lines() {
+                                    println!("      {}", colorize_json_line(line));
+                                }
+                            }
+                            // Output on separate lines (pretty-print JSON if applicable)
                             if let Some(ref output) = tool.output {
-                                println!("  → output:");
-                                // Indent each line of output
-                                for line in output.lines() {
-                                    println!("    {}", line);
+                                println!("    {}→ output:{}", dim, reset);
+                                // Try to prettify if it looks like JSON
+                                let prettified = if output.trim_start().starts_with('{') || output.trim_start().starts_with('[') {
+                                    serde_json::from_str::<serde_json::Value>(output)
+                                        .ok()
+                                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                                } else {
+                                    None
+                                };
+                                let display_output = prettified.as_ref().unwrap_or(output);
+                                for line in display_output.lines() {
+                                    // Colorize JSON output too
+                                    if prettified.is_some() {
+                                        println!("      {}", colorize_json_line(line));
+                                    } else {
+                                        println!("      {}", line);
+                                    }
                                 }
                             }
                         }
