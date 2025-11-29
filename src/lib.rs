@@ -903,11 +903,16 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
     let mut tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new(); // id -> (name, input)
 
     // Define search window based on role:
-    // - User messages: look FORWARD only (tools are in the response), stop at next user text
-    // - Assistant messages: look BACKWARD only (tools precede the response), stop at previous user text
+    //
+    // IMPORTANT: We only match on TEXT messages (user text or assistant text).
+    // Tool invocations are filtered from search results, and tool_results aren't indexed.
+    // See docs/tool-matching.md for detailed explanation.
+    //
+    // - User TEXT: "Please fix the bug" → tools are FORWARD (Claude's response follows)
+    // - Assistant TEXT: "I fixed it" → tools are BACKWARD (Claude used tools before writing text)
     let (window_start, window_end) = match match_role {
-        Some("user") => (match_line, match_line + 30), // Forward for user messages
-        _ => (match_line.saturating_sub(20), match_line), // Backward for assistant
+        Some("user") => (match_line, match_line + 100), // Forward only for user text
+        _ => (match_line.saturating_sub(50), match_line + 10), // Backward for assistant text
     };
     let mut found_turn_boundary = false;
 
