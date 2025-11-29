@@ -95,8 +95,21 @@ impl Connector for CodexConnector {
 
             if ext == Some("jsonl") {
                 // Modern envelope format: each line has {type, timestamp, payload}
-                // Track current model from turn_context entries
+                // Pre-scan to find the first model from turn_context (before any messages)
                 let mut current_model: Option<String> = None;
+                for line in content.lines() {
+                    if let Ok(val) = serde_json::from_str::<Value>(line) {
+                        if val.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
+                            if let Some(model) = val.get("payload")
+                                .and_then(|p| p.get("model"))
+                                .and_then(|m| m.as_str())
+                            {
+                                current_model = Some(model.to_string());
+                                break; // Found the model, stop scanning
+                            }
+                        }
+                    }
+                }
 
                 for line in content.lines() {
                     if line.trim().is_empty() {
@@ -126,18 +139,13 @@ impl Connector for CodexConnector {
                                     .get("cwd")
                                     .and_then(|v| v.as_str())
                                     .map(PathBuf::from);
-                                // Also check for model in session_meta
-                                if current_model.is_none() {
-                                    current_model = payload
-                                        .get("model_provider")
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from);
-                                }
+                                // Don't use model_provider as fallback - it's just "openai"
+                                // The actual model comes from turn_context entries
                             }
                             started_at = started_at.or(created);
                         }
                         "turn_context" => {
-                            // Extract model from turn context
+                            // Extract model from turn context - this has the actual model name
                             if let Some(payload) = val.get("payload") {
                                 if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
                                     current_model = Some(model.to_string());
