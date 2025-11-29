@@ -9,4 +9,7 @@ target/
 *.swo
 /dist/
 /node_modules/
-.beads/
+
+# In-Memoria local database files
+in-memoria.db
+in-memoria-vectors.db/
