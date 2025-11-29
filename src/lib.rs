@@ -169,8 +169,8 @@ pub enum Commands {
         /// "*opus" matches suffix, "\"exact\"" matches exactly.
         #[arg(long)]
         model: Vec<String>,
-        /// Show tool calls/results from source file (optional char limit, default 200 if flag used, 0 = no limit)
-        #[arg(long, num_args = 0..=1, default_missing_value = "200")]
+        /// Show tool calls/results from source file (optional char limit, inherits from -S if not specified, 0 = no limit)
+        #[arg(long, num_args = 0..=1, default_missing_value = "18446744073709551615")]
         tools: Option<usize>,
         /// Include context continuation/summary messages (excluded by default)
         #[arg(long)]
@@ -1162,6 +1162,9 @@ fn run_cli_search(
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
     use std::collections::HashSet;
+
+    // Resolve tools limit: usize::MAX is sentinel for "inherit from snippet_len"
+    let tools = tools.map(|t| if t == usize::MAX { snippet_len } else { t });
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let index_path = index_dir(&data_dir).map_err(|e| CliError {
