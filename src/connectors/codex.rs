@@ -264,7 +264,7 @@ impl Connector for CodexConnector {
                 // Parse items array
                 if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
                     for item in items.iter() {
-                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("agent");
+                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("assistant");
 
                         let content_str = item
                             .get("content")

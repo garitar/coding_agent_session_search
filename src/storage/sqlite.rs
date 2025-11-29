@@ -622,7 +622,7 @@ fn path_to_string<P: AsRef<Path>>(p: P) -> String {
 fn role_str(role: &MessageRole) -> String {
     match role {
         MessageRole::User => "user".to_owned(),
-        MessageRole::Agent => "agent".to_owned(),
+        MessageRole::Agent => "assistant".to_owned(),
         MessageRole::Tool => "tool".to_owned(),
         MessageRole::System => "system".to_owned(),
         MessageRole::Other(v) => v.clone(),

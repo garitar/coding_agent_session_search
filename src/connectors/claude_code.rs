@@ -136,7 +136,7 @@ impl Connector for ClaudeCodeConnector {
                         .and_then(|m| m.get("role"))
                         .and_then(|v| v.as_str())
                         .or(entry_type)
-                        .unwrap_or("agent");
+                        .unwrap_or("assistant");
 
                     // Content from message.content (may be string or array)
                     let content_val = val.get("message").and_then(|m| m.get("content"));
