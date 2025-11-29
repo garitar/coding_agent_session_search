@@ -1116,6 +1116,21 @@ fn model_matches(model: &Option<String>, patterns: &[String]) -> bool {
     })
 }
 
+/// Check if content is a summary/continuation message that should be filtered out.
+/// Matches messages like "This session is being continued from a previous conversation".
+fn is_summary_message(content: &str) -> bool {
+    content.contains("This session is being continued from a previous conversation")
+        || content.contains("conversation is summarized below")
+        || content.contains("context compaction")
+}
+
+/// Check if content is an IDE autocontext message that should be filtered out.
+/// Matches messages starting with "# Context from my IDE setup".
+fn is_autocontext_message(content: &str) -> bool {
+    content.starts_with("# Context from my IDE setup")
+        || content.contains("\n# Context from my IDE setup")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -1126,7 +1141,7 @@ fn run_cli_search(
     json: &bool,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
-    wrap: WrapConfig,
+    _wrap: WrapConfig,
     _progress: ProgressResolved,
     time_filter: TimeFilter,
     turns: Option<String>,
@@ -1199,21 +1214,12 @@ fn run_cli_search(
             }
         }
         // Summary filter
-        if !include_summaries {
-            if hit.content.contains("This session is being continued from a previous conversation")
-                || hit.content.contains("conversation is summarized below")
-                || hit.content.contains("context compaction")
-            {
-                return false;
-            }
+        if !include_summaries && is_summary_message(&hit.content) {
+            return false;
         }
         // Autocontext filter
-        if !include_autocontext {
-            if hit.content.starts_with("# Context from my IDE setup")
-                || hit.content.contains("\n# Context from my IDE setup")
-            {
-                return false;
-            }
+        if !include_autocontext && is_autocontext_message(&hit.content) {
+            return false;
         }
         true
     };
@@ -1376,8 +1382,8 @@ fn run_cli_search(
             if !no_content {
                 // Format: >>> [agent] timestamp [N chars]
                 //           content...
-                let role = hit.role.as_deref().unwrap_or("assistant");
-                let role_color = if role == "user" { user_color } else { agent_color };
+                // Color based on role (user=blue, assistant=green)
+                let role_color = if hit.role.as_deref() == Some("user") { user_color } else { agent_color };
                 let agent_display = format!("{}[{}]{}", role_color, hit.agent, reset);
 
                 // Format timestamp if available
@@ -2008,5 +2014,115 @@ mod tests {
         assert!(model_matches(&Some("claude-opus-4".to_string()), &["sonnet".to_string(), "opus".to_string()]));
         assert!(model_matches(&Some("gpt-4o".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
         assert!(!model_matches(&Some("gemini-pro".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
+    }
+
+    #[test]
+    fn fetch_tools_extracts_tool_use_from_assistant_message() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Create JSONL with tool_use in assistant message
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":"Help me read a file"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_123","name":"Read","input":{{"file_path":"/test.txt"}}}}]}}}}"#).unwrap();
+        drop(file);
+
+        let tools = fetch_tools_from_source(file_path.to_str().unwrap(), 2, 0, Some("assistant"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "Read");
+        assert_eq!(tools[0].id, "toolu_123");
+        assert!(tools[0].input.is_some());
+    }
+
+    #[test]
+    fn fetch_tools_extracts_tool_result_from_user_message() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Create JSONL with tool_use followed by tool_result
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":"Help me"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_abc","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_abc","content":"file1.txt\nfile2.txt"}}]}}}}"#).unwrap();
+        drop(file);
+
+        // Looking forward from user message at line 1
+        let tools = fetch_tools_from_source(file_path.to_str().unwrap(), 1, 0, Some("user"));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "Bash");
+        assert!(tools[0].output.is_some());
+        assert!(tools[0].output.as_ref().unwrap().contains("file1.txt"));
+    }
+
+    #[test]
+    fn fetch_tools_respects_limit() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Create JSONL with long input
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":"Help"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_x","name":"Write","input":{{"content":"This is a very long content string that should be truncated when limit is applied"}}}}]}}}}"#).unwrap();
+        drop(file);
+
+        let tools = fetch_tools_from_source(file_path.to_str().unwrap(), 2, 20, Some("assistant"));
+        assert_eq!(tools.len(), 1);
+        // With limit=20, input should be truncated
+        let input = tools[0].input.as_ref().unwrap();
+        assert!(input.len() < 100, "Input should be truncated: {}", input);
+        assert!(input.ends_with("..."), "Truncated input should end with ...");
+    }
+
+    #[test]
+    fn fetch_tools_stops_at_turn_boundary() {
+        use std::io::Write;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.jsonl");
+
+        // Create JSONL with tools from different turns
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":"First question"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Read","input":{{}}}}]}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"result1"}}]}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Here's the answer"}}]}}}}"#).unwrap();
+        // Turn boundary - next user text message
+        writeln!(file, r#"{{"type":"user","message":{{"content":"Second question"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_2","name":"Write","input":{{}}}}]}}}}"#).unwrap();
+        drop(file);
+
+        // Looking forward from first user message, should only find toolu_1
+        let tools = fetch_tools_from_source(file_path.to_str().unwrap(), 1, 0, Some("user"));
+        assert_eq!(tools.len(), 1, "Should only find 1 tool (toolu_1), found: {:?}", tools);
+        assert_eq!(tools[0].name, "Read");
+    }
+
+    #[test]
+    fn fetch_tools_handles_missing_file() {
+        let tools = fetch_tools_from_source("/nonexistent/path.jsonl", 1, 0, None);
+        assert!(tools.is_empty(), "Should return empty vec for missing file");
+    }
+
+    #[test]
+    fn is_summary_message_detects_continuation() {
+        // Matches context continuation messages
+        assert!(is_summary_message("This session is being continued from a previous conversation that ran out of context."));
+        assert!(is_summary_message("The conversation is summarized below:\n\nPrevious work..."));
+        assert!(is_summary_message("Due to context compaction, some history was removed."));
+        // Does not match normal content
+        assert!(!is_summary_message("Help me write a function"));
+        assert!(!is_summary_message("The user's previous session was productive"));
+    }
+
+    #[test]
+    fn is_autocontext_message_detects_ide_context() {
+        // Matches IDE autocontext headers
+        assert!(is_autocontext_message("# Context from my IDE setup\nVim settings..."));
+        assert!(is_autocontext_message("Some preamble\n# Context from my IDE setup\nSettings"));
+        // Does not match normal content with "Context"
+        assert!(!is_autocontext_message("Here is some context for the task"));
+        assert!(!is_autocontext_message("# IDE Setup Guide\n..."));
     }
 }
