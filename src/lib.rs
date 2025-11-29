@@ -1466,7 +1466,9 @@ fn run_cli_search(
             if let Some(tools_len) = tools {
                 if let Some(line_num) = hit.line_number {
                     let fetched_tools = fetch_tools_from_source(&hit.source_path, line_num, tools_len, hit.role.as_deref());
-                    if !fetched_tools.is_empty() {
+                    // Filter out orphan tool results (those without matching tool_use in window)
+                    let useful_tools: Vec<_> = fetched_tools.into_iter().filter(|t| t.name != "?").collect();
+                    if !useful_tools.is_empty() {
                         // JSON syntax highlighting colors
                         let key_color = "\x1b[34m";    // Blue for keys
                         let str_color = "\x1b[32m";    // Green for strings
@@ -1549,8 +1551,8 @@ fn run_cli_search(
                             result
                         };
 
-                        println!("\n{}Tools ({} calls):{}", dim, fetched_tools.len(), reset);
-                        for tool in &fetched_tools {
+                        println!("\n{}Tools ({} calls):{}", dim, useful_tools.len(), reset);
+                        for tool in &useful_tools {
                             // Tool name header
                             println!("  {}[{}]{}", dim, tool.name, reset);
                             // Input on separate lines (pretty-print JSON with colors)
