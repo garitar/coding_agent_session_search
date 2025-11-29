@@ -671,7 +671,8 @@ impl SearchClient {
     }
 
     /// Fetch surrounding conversation turns for a given message.
-    /// Returns N actual turns before and after the matched message (not index positions).
+    /// A "turn" is defined as a user message + all subsequent assistant messages.
+    /// Returns N user turns before and after the matched message.
     pub fn fetch_surrounding_turns(
         &self,
         conversation_id: i64,
@@ -683,16 +684,86 @@ impl SearchClient {
             anyhow::anyhow!("SQLite connection not available for context fetching")
         })?;
 
-        let mut turns = Vec::new();
+        // Find the user message that starts the turn containing our match
+        // (the most recent user message at or before match_idx)
+        let match_turn_start: i64 = conn
+            .query_row(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ? AND idx <= ? AND role = 'user'
+                 ORDER BY idx DESC LIMIT 1",
+                rusqlite::params![conversation_id, match_idx],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
 
-        // Get N turns before (and including) the match, ordered by idx DESC, then reverse
-        let sql_before = "SELECT idx, role, content, created_at, author FROM messages
-                          WHERE conversation_id = ? AND idx <= ?
-                          ORDER BY idx DESC
-                          LIMIT ?";
-        let mut stmt = conn.prepare(sql_before)?;
+        // Find the Nth user message before the match turn to get start boundary
+        let start_idx: i64 = if turns_before > 0 {
+            conn.query_row(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ? AND idx < ? AND role = 'user'
+                 ORDER BY idx DESC
+                 LIMIT 1 OFFSET ?",
+                rusqlite::params![
+                    conversation_id,
+                    match_turn_start,
+                    turns_before.saturating_sub(1) as i64
+                ],
+                |row| row.get(0),
+            )
+            .unwrap_or(match_turn_start)
+        } else {
+            match_turn_start
+        };
+
+        // Find the Nth user message after the match to get end boundary
+        let end_user_idx: Option<i64> = if turns_after > 0 {
+            conn.query_row(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ? AND idx > ? AND role = 'user'
+                 ORDER BY idx ASC
+                 LIMIT 1 OFFSET ?",
+                rusqlite::params![
+                    conversation_id,
+                    match_idx,
+                    turns_after.saturating_sub(1) as i64
+                ],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        // Find where to stop: just before the next user message after end_user_idx
+        let end_idx: i64 = if let Some(end_user) = end_user_idx {
+            // Include all messages in the end_user's turn (up to next user or end)
+            conn.query_row(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ? AND idx > ? AND role = 'user'
+                 ORDER BY idx ASC LIMIT 1",
+                rusqlite::params![conversation_id, end_user],
+                |row| row.get(0),
+            )
+            .unwrap_or(i64::MAX)
+        } else {
+            // No end boundary, include all remaining messages in the match's turn
+            conn.query_row(
+                "SELECT idx FROM messages
+                 WHERE conversation_id = ? AND idx > ? AND role = 'user'
+                 ORDER BY idx ASC LIMIT 1",
+                rusqlite::params![conversation_id, match_idx],
+                |row| row.get(0),
+            )
+            .unwrap_or(i64::MAX)
+        };
+
+        // Fetch all messages from start to end
+        let sql = "SELECT idx, role, content, created_at, author FROM messages
+                   WHERE conversation_id = ? AND idx >= ? AND idx < ?
+                   ORDER BY idx ASC";
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(
-            rusqlite::params![conversation_id, match_idx, turns_before as i64 + 1],
+            rusqlite::params![conversation_id, start_idx, end_idx],
             |row| {
                 let idx: i64 = row.get(0)?;
                 let role: String = row.get(1)?;
@@ -710,36 +781,7 @@ impl SearchClient {
             },
         )?;
 
-        for row in rows {
-            turns.push(row?);
-        }
-        turns.reverse(); // Put in chronological order
-
-        // Get N turns after the match
-        let sql_after = "SELECT idx, role, content, created_at, author FROM messages
-                         WHERE conversation_id = ? AND idx > ?
-                         ORDER BY idx ASC
-                         LIMIT ?";
-        let mut stmt = conn.prepare(sql_after)?;
-        let rows = stmt.query_map(
-            rusqlite::params![conversation_id, match_idx, turns_after as i64],
-            |row| {
-                let idx: i64 = row.get(0)?;
-                let role: String = row.get(1)?;
-                let content: String = row.get(2)?;
-                let created_at: Option<i64> = row.get(3).ok();
-                let author: Option<String> = row.get(4).ok();
-                Ok(ContextTurn {
-                    turn_index: idx,
-                    role,
-                    content,
-                    created_at,
-                    author,
-                    is_match: false, // These are after the match
-                })
-            },
-        )?;
-
+        let mut turns = Vec::new();
         for row in rows {
             turns.push(row?);
         }

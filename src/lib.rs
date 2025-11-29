@@ -1438,7 +1438,7 @@ fn run_cli_search(
             // Print context turns if available
             if let Some(ref context) = hit.context {
                 let hint = if snippet_len == 0 { "" } else { ", use --json or -S 0 for full content" };
-                println!("\nContext ({} messages{}):", context.len(), hint);
+                println!("\nContext ({} turns{}):", context.len(), hint);
                 for turn in context {
                     let marker = if turn.is_match { ">>>" } else { "   " };
                     let role_color = if turn.role == "user" { user_color } else { agent_color };
