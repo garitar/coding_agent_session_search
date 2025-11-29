@@ -43,9 +43,9 @@ pub struct ContextTurn {
     /// Timestamp of this turn (milliseconds since epoch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
-    /// The model used for this turn (e.g., "claude-sonnet-4-20250514")
+    /// The author of this turn - "User" for user, model name for assistant
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub author: Option<String>,
     /// Whether this is the matched turn (the search hit itself)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_match: bool,
@@ -63,9 +63,9 @@ pub struct SearchHit {
     /// The role of this message (e.g., "user", "assistant")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// The model used for this message (e.g., "claude-sonnet-4-20250514")
+    /// The author of this message - "User" for user messages, model name for assistant
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub author: Option<String>,
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
     pub line_number: Option<usize>,
@@ -518,7 +518,7 @@ impl SearchClient {
                 agent,
                 workspace,
                 role: None,  // Not in Tantivy index; enriched from SQLite later
-                model: None, // Not in Tantivy index; enriched from SQLite later
+                author: None, // Not in Tantivy index; enriched from SQLite later
                 created_at,
                 line_number: None, // TODO: populate from index if stored
                 message_id: None,  // Not available from Tantivy index
@@ -605,7 +605,7 @@ impl SearchClient {
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let message_id: Option<i64> = row.get(9).ok();
                 let conversation_id: Option<i64> = row.get(10).ok();
-                let model: Option<String> = row.get(11).ok();
+                let author: Option<String> = row.get(11).ok();
                 let role: Option<String> = row.get(12).ok();
                 Ok(SearchHit {
                     title,
@@ -616,7 +616,7 @@ impl SearchClient {
                     agent,
                     workspace,
                     role,
-                    model,
+                    author,
                     created_at,
                     line_number,
                     message_id,
@@ -663,8 +663,8 @@ impl SearchClient {
             if hit.role.is_none() {
                 hit.role = role;
             }
-            if hit.model.is_none() {
-                hit.model = author;
+            if hit.author.is_none() {
+                hit.author = author;
             }
         }
         Ok(())
@@ -698,13 +698,13 @@ impl SearchClient {
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
                 let created_at: Option<i64> = row.get(3).ok();
-                let model: Option<String> = row.get(4).ok();
+                let author: Option<String> = row.get(4).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
                     created_at,
-                    model,
+                    author,
                     is_match: idx == match_idx,
                 })
             },
@@ -728,13 +728,13 @@ impl SearchClient {
                 let role: String = row.get(1)?;
                 let content: String = row.get(2)?;
                 let created_at: Option<i64> = row.get(3).ok();
-                let model: Option<String> = row.get(4).ok();
+                let author: Option<String> = row.get(4).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
                     created_at,
-                    model,
+                    author,
                     is_match: false, // These are after the match
                 })
             },
@@ -1081,7 +1081,7 @@ mod tests {
             agent: "a".into(),
             workspace: "w".into(),
             role: None,
-            model: None,
+            author: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1109,7 +1109,7 @@ mod tests {
             agent: "a".into(),
             workspace: "w".into(),
             role: None,
-            model: None,
+            author: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1537,7 +1537,7 @@ mod tests {
             content: "Hello world".to_string(),
             turn_index: 0,
             created_at: Some(1700000000000), // Nov 14, 2023
-            model: None,
+            author: None,
             is_match: true,
         };
         assert_eq!(turn.created_at, Some(1700000000000));
@@ -1556,7 +1556,7 @@ mod tests {
             content: "Hi there".to_string(),
             turn_index: 1,
             created_at: None,
-            model: None,
+            author: None,
             is_match: false,
         };
         let json = serde_json::to_string(&turn).unwrap();

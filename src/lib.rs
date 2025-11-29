@@ -1223,7 +1223,7 @@ fn run_cli_search(
         }
         // Model filter
         if !model_patterns.is_empty() {
-            if !model_matches(&hit.model, &model_patterns) {
+            if !model_matches(&hit.author, &model_patterns) {
                 return false;
             }
         }
@@ -1265,7 +1265,7 @@ fn run_cli_search(
 
         for mut hit in batch {
             // Enrich Tantivy hits with role/model from SQLite (needed for filtering)
-            if hit.role.is_none() || hit.model.is_none() || hit.line_number.is_none() {
+            if hit.role.is_none() || hit.author.is_none() || hit.line_number.is_none() {
                 let _ = client.enrich_hit_for_context(&mut hit);
             }
 
@@ -1384,7 +1384,7 @@ fn run_cli_search(
             // Better separator with hit number
             println!("{}═══════════════════════════════════════════════════════════════════{}", dim, reset);
             // Build headline with optional model (in parentheses after agent, dimmed)
-            let model_str = hit.model.as_ref()
+            let model_str = hit.author.as_ref()
                 .map(|m| format!(" {}({}){}", dim, m, reset))
                 .unwrap_or_default();
             println!("{}[{}/{}]{} Score: {:.2} | {}{} | WS: {}",
@@ -1398,7 +1398,13 @@ fn run_cli_search(
                 //           content...
                 // Color based on role (user=blue, assistant=green)
                 let role_color = if hit.role.as_deref() == Some("user") { user_color } else { agent_color };
-                let agent_display = format!("{}[{}]{}", role_color, hit.agent, reset);
+                // Show [User] for user messages, [model] or [agent] for assistant
+                let display_name = if hit.role.as_deref() == Some("user") {
+                    "User".to_string()
+                } else {
+                    hit.author.clone().unwrap_or_else(|| hit.agent.clone())
+                };
+                let agent_display = format!("{}[{}]{}", role_color, display_name, reset);
 
                 // Format timestamp if available
                 let ts_display = hit.created_at
@@ -1436,7 +1442,13 @@ fn run_cli_search(
                 for turn in context {
                     let marker = if turn.is_match { ">>>" } else { "   " };
                     let role_color = if turn.role == "user" { user_color } else { agent_color };
-                    let role_display = format!("{}[{}]{}", role_color, turn.role, reset);
+                    // Show [User] for user messages, [model] or role for assistant
+                    let display_name = if turn.role == "user" {
+                        "User".to_string()
+                    } else {
+                        turn.author.clone().unwrap_or_else(|| turn.role.clone())
+                    };
+                    let role_display = format!("{}[{}]{}", role_color, display_name, reset);
 
                     // Format timestamp if available
                     let ts_display = turn.created_at
@@ -1446,7 +1458,7 @@ fn run_cli_search(
 
                     // Format model if --full-model and available
                     let model_display = if full_model {
-                        turn.model.as_ref()
+                        turn.author.as_ref()
                             .map(|m| format!(" {}[{}]{}", dim, m, reset))
                             .unwrap_or_default()
                     } else {
