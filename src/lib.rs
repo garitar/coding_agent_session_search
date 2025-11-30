@@ -926,8 +926,8 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
     // - User TEXT: "Please fix the bug" → tools are FORWARD (Claude's response follows)
     // - Assistant TEXT: "I fixed it" → tools are BACKWARD (Claude used tools before writing text)
     let (window_start, window_end) = match match_role {
-        Some("user") => (match_line, match_line + 100), // Forward only for user text
-        _ => (match_line.saturating_sub(50), match_line + 10), // Backward for assistant text
+        Some("user") => (match_line, match_line + 500), // Forward only for user text
+        _ => (match_line.saturating_sub(500), match_line + 10), // Backward for assistant text
     };
     let mut found_turn_boundary = false;
     let is_assistant_match = match_role != Some("user");
