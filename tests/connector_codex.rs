@@ -132,3 +132,72 @@ fn codex_connector_filters_token_count() {
         assert!(!msg.content.trim().is_empty());
     }
 }
+
+#[test]
+fn codex_connector_extracts_model_from_turn_context() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/11/24");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-model.jsonl");
+
+    // turn_context contains the actual model name (not session_meta.model_provider which is just "openai")
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-id","cwd":"/test","model_provider":"openai"}}
+{"timestamp":"2025-09-30T15:42:35.000Z","type":"turn_context","payload":{"turn":1,"model":"gpt-4o"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2025-09-30T15:42:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"world"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+    let c = &convs[0];
+
+    // Both messages should have the model from turn_context
+    assert_eq!(c.messages.len(), 2);
+    for msg in &c.messages {
+        assert_eq!(msg.model, Some("gpt-4o".to_string()), "model should be extracted from turn_context");
+    }
+}
+
+#[test]
+fn codex_connector_handles_missing_model() {
+    let dir = TempDir::new().unwrap();
+    let sessions = dir.path().join("sessions/2025/11/25");
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join("rollout-no-model.jsonl");
+
+    // Session without turn_context model - should still work, just with None model
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-id","cwd":"/test"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2025-09-30T15:42:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"world"}]}}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", dir.path());
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_root: dir.path().to_path_buf(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+    let c = &convs[0];
+
+    // Messages should have None model (not "openai" from model_provider)
+    assert_eq!(c.messages.len(), 2);
+    for msg in &c.messages {
+        assert_eq!(msg.model, None, "model should be None when turn_context lacks model");
+    }
+}
