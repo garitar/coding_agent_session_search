@@ -11,6 +11,7 @@ fn norm_msg(idx: i64) -> NormalizedMessage {
         idx,
         role: "user".into(),
         author: None,
+        model: None,
         created_at: Some(1_700_000_000_000 + idx),
         content: format!("hello-{idx}"),
         extra: serde_json::json!({}),

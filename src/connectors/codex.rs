@@ -157,23 +157,39 @@ impl Connector for CodexConnector {
                             if let Some(payload) = val.get("payload") {
                                 let payload_type = payload.get("type").and_then(|v| v.as_str());
 
-                                // Determine role: explicit role, or infer from payload type
-                                let role = payload
-                                    .get("role")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_else(|| {
-                                        // Infer role from payload type for messages without explicit role
-                                        match payload_type {
-                                            Some("reasoning") => "assistant",
-                                            Some("message") => "assistant", // default messages to assistant
-                                            _ => "assistant", // tool calls etc default to assistant
-                                        }
-                                    });
+                                // Determine role: "tool" for function_call/function_call_output,
+                                // otherwise explicit role or infer from payload type
+                                let role = match payload_type {
+                                    Some("function_call") | Some("function_call_output") => "tool",
+                                    _ => payload
+                                        .get("role")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_else(|| {
+                                            // Infer role from payload type for messages without explicit role
+                                            match payload_type {
+                                                Some("reasoning") => "assistant",
+                                                Some("message") => "assistant",
+                                                _ => "assistant",
+                                            }
+                                        }),
+                                };
 
-                                let content_str = payload
-                                    .get("content")
-                                    .map(crate::connectors::flatten_content)
-                                    .unwrap_or_default();
+                                // Extract content from various field names:
+                                // - "content" for message/reasoning types
+                                // - "output" for function_call_output types
+                                // - "name" + "arguments" for function_call types
+                                let content_str = if payload_type == Some("function_call") {
+                                    // For function calls, combine name and arguments
+                                    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let args = payload.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                                    format!("[Tool: {}] {}", name, args)
+                                } else {
+                                    payload
+                                        .get("content")
+                                        .or_else(|| payload.get("output"))
+                                        .map(crate::connectors::flatten_content)
+                                        .unwrap_or_default()
+                                };
 
                                 if content_str.trim().is_empty() {
                                     continue;
@@ -182,10 +198,18 @@ impl Connector for CodexConnector {
                                 started_at = started_at.or(created);
                                 ended_at = created.or(ended_at);
 
+                                // author = None for user, model for assistant
+                                let author = if role == "user" {
+                                    None
+                                } else {
+                                    current_model.clone()
+                                };
+
                                 messages.push(NormalizedMessage {
                                     idx: 0, // will be re-assigned after filtering
                                     role: role.to_string(),
-                                    author: current_model.clone(),
+                                    author,
+                                    model: current_model.clone(),
                                     created_at: created,
                                     content: content_str,
                                     extra: val,
@@ -193,60 +217,14 @@ impl Connector for CodexConnector {
                                 });
                             }
                         }
-                        "event_msg" => {
-                            // Event messages - filter by payload type
-                            if let Some(payload) = val.get("payload") {
-                                let event_type = payload.get("type").and_then(|v| v.as_str());
-
-                                match event_type {
-                                    Some("user_message") => {
-                                        let text = payload
-                                            .get("message")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            ended_at = created.or(ended_at);
-                                            messages.push(NormalizedMessage {
-                                                idx: 0, // will be re-assigned after filtering
-                                                role: "user".to_string(),
-                                                author: current_model.clone(),
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: val.clone(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
-                                    }
-                                    Some("agent_reasoning") => {
-                                        // Include reasoning - valuable for search
-                                        let text = payload
-                                            .get("text")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        if !text.is_empty() {
-                                            ended_at = created.or(ended_at);
-                                            messages.push(NormalizedMessage {
-                                                idx: 0, // will be re-assigned after filtering
-                                                role: "assistant".to_string(),
-                                                author: current_model.clone(),
-                                                created_at: created,
-                                                content: text.to_string(),
-                                                extra: val.clone(),
-                                                snippets: Vec::new(),
-                                            });
-                                        }
-                                    }
-                                    _ => {} // Skip token_count, turn_aborted, etc.
-                                }
-                            }
-                        }
-                        _ => {} // Skip turn_context and unknown types
+                        // Skip event_msg entirely - all content duplicates response_item:
+                        // - user_message duplicates response_item with role=user
+                        // - agent_message duplicates response_item with role=assistant
+                        // - agent_reasoning duplicates response_item with type=reasoning
+                        _ => {}
                     }
                 }
-                // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+                crate::connectors::finalize_messages(&mut messages);
             } else if ext == Some("json") {
                 // Legacy format: single JSON object with {session, items}
                 let val: Value = match serde_json::from_str(&content) {
@@ -292,6 +270,7 @@ impl Connector for CodexConnector {
                             idx: 0, // will be re-assigned after filtering
                             role: role.to_string(),
                             author: None,
+                            model: None, // TODO: extract if available in legacy format
                             created_at: created,
                             content: content_str,
                             extra: item.clone(),
@@ -299,10 +278,7 @@ impl Connector for CodexConnector {
                         });
                     }
                 }
-                // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+                crate::connectors::finalize_messages(&mut messages);
             }
 
             if messages.is_empty() {

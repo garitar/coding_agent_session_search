@@ -29,6 +29,8 @@ pub struct SearchFilters {
     pub role: Option<String>,
     /// Filter by model name (supports glob patterns: "opus" → contains, "gpt-5*" → prefix, "*opus" → suffix, "\"exact\"" → exact)
     pub models: Vec<String>,
+    /// Exclude tool calls/results from search (default true for cleaner results)
+    pub exclude_tools: bool,
 }
 
 /// A conversation turn included as context around a search hit
@@ -43,9 +45,12 @@ pub struct ContextTurn {
     /// Timestamp of this turn (milliseconds since epoch)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
-    /// The author of this turn - "User" for user, model name for assistant
+    /// The author of this turn (None for user, model name for assistant)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// The AI model active for this turn (for all messages, used in display/filtering)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Whether this is the matched turn (the search hit itself)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_match: bool,
@@ -63,9 +68,12 @@ pub struct SearchHit {
     /// The role of this message (e.g., "user", "assistant")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// The author of this message - "User" for user messages, model name for assistant
+    /// The author of this message (None for user, model name for assistant)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// The AI model active for this message (for all messages, used in headline/filtering)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
     pub line_number: Option<usize>,
@@ -452,6 +460,17 @@ impl SearchClient {
             clauses.push((Occur::Must, Box::new(range)));
         }
 
+        // Exclude tool messages (role="tool") unless --search-tools is passed
+        if filters.exclude_tools {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(fields.role, "tool"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
         let q: Box<dyn Query> = if clauses.is_empty() {
             Box::new(AllQuery)
         } else if clauses.len() == 1 {
@@ -509,6 +528,10 @@ impl SearchClient {
                 .unwrap_or("")
                 .to_string();
             let created_at = doc.get_first(fields.created_at).and_then(|v| v.as_i64());
+            let role = doc
+                .get_first(fields.role)
+                .and_then(|v| v.as_str())
+                .map(String::from);
             hits.push(SearchHit {
                 title,
                 snippet,
@@ -517,8 +540,9 @@ impl SearchClient {
                 source_path: source,
                 agent,
                 workspace,
-                role: None,  // Not in Tantivy index; enriched from SQLite later
+                role,         // Now extracted from Tantivy index
                 author: None, // Not in Tantivy index; enriched from SQLite later
+                model: None,  // Not in Tantivy index; enriched from SQLite later
                 created_at,
                 line_number: None, // TODO: populate from index if stored
                 message_id: None,  // Not available from Tantivy index
@@ -542,7 +566,7 @@ impl SearchClient {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id, m.author, m.role
+            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx, f.message_id, m.conversation_id, m.author, m.role, m.model
              FROM fts_messages f
              LEFT JOIN messages m ON f.message_id = m.id
              WHERE fts_messages MATCH ?",
@@ -607,6 +631,7 @@ impl SearchClient {
                 let conversation_id: Option<i64> = row.get(10).ok();
                 let author: Option<String> = row.get(11).ok();
                 let role: Option<String> = row.get(12).ok();
+                let model: Option<String> = row.get(13).ok();
                 Ok(SearchHit {
                     title,
                     snippet,
@@ -617,6 +642,7 @@ impl SearchClient {
                     workspace,
                     role,
                     author,
+                    model,
                     created_at,
                     line_number,
                     message_id,
@@ -642,7 +668,7 @@ impl SearchClient {
 
         // Look up the message by content (first 500 chars to handle truncation)
         let content_prefix: String = hit.content.chars().take(500).collect();
-        let sql = "SELECT m.id, m.conversation_id, m.idx, m.role, m.author FROM messages m
+        let sql = "SELECT m.id, m.conversation_id, m.idx, m.role, m.author, m.model FROM messages m
                    WHERE m.content LIKE ? || '%'
                    LIMIT 1";
 
@@ -653,10 +679,11 @@ impl SearchClient {
             let idx: i64 = row.get(2)?;
             let role: Option<String> = row.get(3).ok();
             let author: Option<String> = row.get(4).ok();
-            Ok((id, conversation_id, idx, role, author))
+            let model: Option<String> = row.get(5).ok();
+            Ok((id, conversation_id, idx, role, author, model))
         });
 
-        if let Ok((id, conv_id, idx, role, author)) = result {
+        if let Ok((id, conv_id, idx, role, author, model)) = result {
             hit.message_id = Some(id);
             hit.conversation_id = Some(conv_id);
             hit.line_number = Some((idx + 1) as usize);
@@ -665,6 +692,9 @@ impl SearchClient {
             }
             if hit.author.is_none() {
                 hit.author = author;
+            }
+            if hit.model.is_none() {
+                hit.model = model;
             }
         }
         Ok(())
@@ -758,7 +788,7 @@ impl SearchClient {
         };
 
         // Fetch all messages from start to end
-        let sql = "SELECT idx, role, content, created_at, author FROM messages
+        let sql = "SELECT idx, role, content, created_at, author, model FROM messages
                    WHERE conversation_id = ? AND idx >= ? AND idx < ?
                    ORDER BY idx ASC";
         let mut stmt = conn.prepare(sql)?;
@@ -770,12 +800,14 @@ impl SearchClient {
                 let content: String = row.get(2)?;
                 let created_at: Option<i64> = row.get(3).ok();
                 let author: Option<String> = row.get(4).ok();
+                let model: Option<String> = row.get(5).ok();
                 Ok(ContextTurn {
                     turn_index: idx,
                     role,
                     content,
                     created_at,
                     author,
+                    model,
                     is_match: idx == match_idx,
                 })
             },
@@ -1124,6 +1156,7 @@ mod tests {
             workspace: "w".into(),
             role: None,
             author: None,
+            model: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1152,6 +1185,7 @@ mod tests {
             workspace: "w".into(),
             role: None,
             author: None,
+            model: None,
             created_at: None,
             line_number: None,
             message_id: None,
@@ -1187,6 +1221,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: Some("me".into()),
+                model: None,
                 created_at: Some(1_700_000_000_000),
                 content: "hello rust world".into(),
                 extra: serde_json::json!({}),
@@ -1231,6 +1266,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(10),
                 content: "alpha needle".into(),
                 extra: serde_json::json!({}),
@@ -1256,6 +1292,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(20),
                 content: "\nneedle second line".into(),
                 extra: serde_json::json!({}),
@@ -1303,6 +1340,7 @@ mod tests {
                     idx: 0,
                     role: "user".into(),
                     author: None,
+                    model: None,
                     created_at: Some(100 + i),
                     content: "pagination needle".into(),
                     extra: serde_json::json!({}),
@@ -1342,6 +1380,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: Some("me".into()),
+                model: None,
                 created_at: Some(1_700_000_000_000),
                 content: "Need CMA-ES strategy and CMA ES variants".into(),
                 extra: serde_json::json!({}),
@@ -1381,6 +1420,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(1000),
                 content: "please calculate the entropy".into(),
                 extra: serde_json::json!({}),
@@ -1421,6 +1461,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(1),
                 content: "check the my_variable_name please".into(),
                 extra: serde_json::json!({}),
@@ -1460,6 +1501,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(1),
                 content: "working with c++ and foo.bar today".into(),
                 extra: serde_json::json!({}),
@@ -1501,6 +1543,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(1),
                 content: "apple banana".into(),
                 extra: serde_json::json!({}),
@@ -1539,6 +1582,7 @@ mod tests {
                 idx: 0,
                 role: "user".into(),
                 author: None,
+                model: None,
                 created_at: Some(2),
                 content: "apricot".into(),
                 extra: serde_json::json!({}),
@@ -1580,6 +1624,7 @@ mod tests {
             turn_index: 0,
             created_at: Some(1700000000000), // Nov 14, 2023
             author: None,
+            model: Some("claude-3-opus".to_string()),
             is_match: true,
         };
         assert_eq!(turn.created_at, Some(1700000000000));
@@ -1599,6 +1644,7 @@ mod tests {
             turn_index: 1,
             created_at: None,
             author: None,
+            model: None,
             is_match: false,
         };
         let json = serde_json::to_string(&turn).unwrap();

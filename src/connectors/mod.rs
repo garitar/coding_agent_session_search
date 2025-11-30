@@ -51,7 +51,10 @@ pub struct NormalizedConversation {
 pub struct NormalizedMessage {
     pub idx: i64,
     pub role: String,
+    /// Who wrote this message (None for user, model name for assistant)
     pub author: Option<String>,
+    /// The AI model active in this conversation (for all messages, used in display/filtering)
+    pub model: Option<String>,
     pub created_at: Option<i64>,
     pub content: String,
     pub extra: serde_json::Value,
@@ -127,6 +130,7 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
                     if item_type.is_none()
                         || item_type == Some("text")
                         || item_type == Some("input_text")
+                        || item_type == Some("summary_text") // Codex reasoning
                     {
                         return Some(text.to_string());
                     }
@@ -154,6 +158,13 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
                     return Some(format!("[Tool: {} - {}]", name, desc));
                 }
 
+                // Tool result block - include the output content
+                if item_type == Some("tool_result") {
+                    if let Some(content) = item.get("content").and_then(|v| v.as_str()) {
+                        return Some(content.to_string());
+                    }
+                }
+
                 None
             })
             .collect();
@@ -161,4 +172,27 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
     }
 
     String::new()
+}
+
+/// Post-process messages after extraction from raw format:
+/// 1. Backfill user messages with the model from the next assistant response
+/// 2. Reassign sequential indices (after any filtering during extraction)
+///
+/// This should be called after all messages are extracted but before
+/// creating the NormalizedConversation.
+pub fn finalize_messages(messages: &mut Vec<NormalizedMessage>) {
+    // Backfill: iterate in reverse so user messages get the model
+    // of the assistant that responds to them
+    let mut last_model: Option<String> = None;
+    for msg in messages.iter_mut().rev() {
+        if msg.role == "user" {
+            msg.model = last_model.clone();
+        } else if msg.model.is_some() {
+            last_model = msg.model.clone();
+        }
+    }
+    // Reassign sequential indices (0-based)
+    for (i, msg) in messages.iter_mut().enumerate() {
+        msg.idx = i as i64;
+    }
 }

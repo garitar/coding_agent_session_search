@@ -42,15 +42,16 @@ fn codex_connector_reads_modern_envelope_jsonl() {
 }
 
 #[test]
-fn codex_connector_includes_agent_reasoning() {
+fn codex_connector_includes_reasoning() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/22");
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join("rollout-reasoning.jsonl");
 
+    // Use canonical response_item format for reasoning (not event_msg which is duplicate)
     let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-id","cwd":"/test"}}
 {"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"solve this problem"}]}}
-{"timestamp":"2025-09-30T15:42:40.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Let me think about this carefully..."}}
+{"timestamp":"2025-09-30T15:42:40.000Z","type":"response_item","payload":{"type":"reasoning","content":[{"type":"summary_text","text":"Let me think about this carefully..."}]}}
 {"timestamp":"2025-09-30T15:42:43.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"here is solution"}]}}
 {"timestamp":"2025-09-30T15:42:45.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":100,"output_tokens":200}}
 "#;
@@ -70,7 +71,7 @@ fn codex_connector_includes_agent_reasoning() {
     let c = &convs[0];
 
     // Should have 3 messages: user, reasoning, assistant
-    // (token_count is filtered out)
+    // (token_count event_msg is skipped)
     assert_eq!(c.messages.len(), 3);
 
     // Check reasoning is included - find by payload type in extra field
@@ -82,9 +83,9 @@ fn codex_connector_includes_agent_reasoning() {
                 .get("payload")
                 .and_then(|p| p.get("type"))
                 .and_then(|t| t.as_str())
-                == Some("agent_reasoning")
+                == Some("reasoning")
         });
-    assert!(reasoning.is_some(), "should include agent_reasoning message");
+    assert!(reasoning.is_some(), "should include reasoning message");
     assert!(
         reasoning
             .unwrap()

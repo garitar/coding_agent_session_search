@@ -388,6 +388,7 @@ fn message_from_row(row: &Row<'_>, cols: &[String]) -> rusqlite::Result<Normaliz
         idx: 0,
         role,
         author,
+        model: None, // TODO: extract if available
         created_at,
         content,
         extra: serde_json::Value::Object(extra),

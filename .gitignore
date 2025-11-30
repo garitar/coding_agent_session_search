@@ -13,3 +13,7 @@ target/
 # In-Memoria local database files
 in-memoria.db
 in-memoria-vectors.db/
+
+# Investigation/handoff docs (session-specific debugging notes)
+INVESTIGATION-*.md
+HANDOFF-*.md

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_V1: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS messages (
     idx INTEGER NOT NULL,
     role TEXT NOT NULL,
     author TEXT,
+    model TEXT,
     created_at INTEGER,
     content TEXT NOT NULL,
     extra_json TEXT,
@@ -141,6 +142,10 @@ FROM messages m
 JOIN conversations c ON m.conversation_id = c.id
 JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
+"#;
+
+const MIGRATION_V4: &str = r#"
+ALTER TABLE messages ADD COLUMN model TEXT;
 "#;
 
 pub struct SqliteStorage {
@@ -395,7 +400,7 @@ impl SqliteStorage {
 
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, idx, role, author, created_at, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx",
+            "SELECT id, idx, role, author, model, created_at, content, extra_json FROM messages WHERE conversation_id = ? ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![conversation_id], |row| {
             let role: String = row.get(2)?;
@@ -410,10 +415,11 @@ impl SqliteStorage {
                     other => MessageRole::Other(other.to_string()),
                 },
                 author: row.get(3).ok(),
-                created_at: row.get(4).ok(),
-                content: row.get(5)?,
+                model: row.get(4).ok(),
+                created_at: row.get(5).ok(),
+                content: row.get(6)?,
                 extra_json: row
-                    .get::<_, Option<String>>(6)?
+                    .get::<_, Option<String>>(7)?
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 snippets: Vec::new(),
@@ -502,6 +508,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V1)?;
             conn.execute_batch(MIGRATION_V2)?;
             conn.execute_batch(MIGRATION_V3)?;
+            // V4 not needed - V1 already has model column
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 params![SCHEMA_VERSION.to_string()],
@@ -510,6 +517,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         1 => {
             conn.execute_batch(MIGRATION_V2)?;
             conn.execute_batch(MIGRATION_V3)?;
+            conn.execute_batch(MIGRATION_V4)?;
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 params![SCHEMA_VERSION.to_string()],
@@ -517,6 +525,14 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         }
         2 => {
             conn.execute_batch(MIGRATION_V3)?;
+            conn.execute_batch(MIGRATION_V4)?;
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                params![SCHEMA_VERSION.to_string()],
+            )?;
+        }
+        3 => {
+            conn.execute_batch(MIGRATION_V4)?;
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 params![SCHEMA_VERSION.to_string()],
@@ -556,13 +572,14 @@ fn insert_conversation(
 
 fn insert_message(tx: &Transaction<'_>, conversation_id: i64, msg: &Message) -> Result<i64> {
     tx.execute(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json)
-         VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO messages(conversation_id, idx, role, author, model, created_at, content, extra_json)
+         VALUES(?,?,?,?,?,?,?,?)",
         params![
             conversation_id,
             msg.idx,
             role_str(&msg.role),
             msg.author,
+            msg.model,
             msg.created_at,
             msg.content,
             serde_json::to_string(&msg.extra_json)?

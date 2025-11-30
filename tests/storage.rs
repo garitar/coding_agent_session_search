@@ -35,6 +35,7 @@ fn msg(idx: i64, created_at: i64) -> Message {
         idx,
         role: MessageRole::User,
         author: Some("user".into()),
+        model: None,
         created_at: Some(created_at),
         content: format!("msg-{idx}"),
         extra_json: serde_json::json!({}),
@@ -48,7 +49,7 @@ fn schema_version_created_on_open() {
     let db_path = tmp.path().join("store.db");
     let storage = SqliteStorage::open(&db_path).expect("open");
 
-    assert_eq!(storage.schema_version().unwrap(), 3);
+    assert_eq!(storage.schema_version().unwrap(), 4);
 
     // If meta row is removed, the getter surfaces an error.
     storage.raw().execute("DELETE FROM meta", []).unwrap();

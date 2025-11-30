@@ -286,6 +286,7 @@ impl Connector for GeminiConnector {
                     idx: 0, // will be re-assigned after filtering
                     role: role.to_string(),
                     author: None,
+                    model: None, // TODO: extract if available
                     created_at: created,
                     content: content_str,
                     extra: item.clone(),

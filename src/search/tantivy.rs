@@ -6,10 +6,10 @@ use tantivy::{Index, IndexReader, IndexWriter, doc};
 
 use crate::connectors::NormalizedConversation;
 
-const SCHEMA_VERSION: &str = "v4";
+pub const SCHEMA_VERSION: &str = "v5";
 
 // Bump this when schema/tokenizer changes. Used to trigger rebuilds.
-pub const SCHEMA_HASH: &str = "tantivy-schema-v4-edge-ngram-preview";
+pub const SCHEMA_HASH: &str = "tantivy-schema-v5-role-field";
 
 #[derive(Clone, Copy)]
 pub struct Fields {
@@ -23,6 +23,7 @@ pub struct Fields {
     pub title_prefix: Field,
     pub content_prefix: Field,
     pub preview: Field,
+    pub role: Field,
 }
 
 pub struct TantivyIndex {
@@ -104,6 +105,7 @@ impl TantivyIndex {
                 self.fields.source_path => conv.source_path.to_string_lossy().into_owned(),
                 self.fields.msg_idx => msg.idx as u64,
                 self.fields.content => msg.content.clone(),
+                self.fields.role => msg.role.clone(),
             };
             if let Some(ws) = &conv.workspace {
                 d.add_text(self.fields.workspace, ws.to_string_lossy());
@@ -171,6 +173,8 @@ pub fn build_schema() -> Schema {
     schema_builder.add_text_field("title_prefix", text_not_stored.clone());
     schema_builder.add_text_field("content_prefix", text_not_stored);
     schema_builder.add_text_field("preview", TEXT | STORED);
+    // Role field for filtering (STRING for exact match, not tokenized)
+    schema_builder.add_text_field("role", STRING | STORED);
     schema_builder.build()
 }
 
@@ -191,6 +195,7 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
         title_prefix: get("title_prefix")?,
         content_prefix: get("content_prefix")?,
         preview: get("preview")?,
+        role: get("role")?,
     })
 }
 

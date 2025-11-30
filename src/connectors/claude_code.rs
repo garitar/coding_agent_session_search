@@ -130,46 +130,69 @@ impl Connector for ClaudeCodeConnector {
                     started_at = started_at.or(created);
                     ended_at = created.or(ended_at);
 
-                    // Role from message.role or entry type
-                    let role = val
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|v| v.as_str())
-                        .or(entry_type)
-                        .unwrap_or("assistant");
-
                     // Content from message.content (may be string or array)
                     let content_val = val.get("message").and_then(|m| m.get("content"));
                     let content_str = content_val
                         .map(crate::connectors::flatten_content)
                         .unwrap_or_default();
 
+                    // Check if content contains tool_use or tool_result
+                    let is_tool_message = content_val
+                        .and_then(|c| c.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|item| {
+                                matches!(
+                                    item.get("type").and_then(|t| t.as_str()),
+                                    Some("tool_use") | Some("tool_result")
+                                )
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    // Role: "tool" for tool_use/tool_result, otherwise from message.role or entry type
+                    let role = if is_tool_message {
+                        "tool"
+                    } else {
+                        val.get("message")
+                            .and_then(|m| m.get("role"))
+                            .and_then(|v| v.as_str())
+                            .or(entry_type)
+                            .unwrap_or("assistant")
+                    };
+
                     // Skip entries with empty content
                     if content_str.trim().is_empty() {
                         continue;
                     }
 
-                    // Extract model name for author field
-                    let author = val
+                    // Extract model from assistant messages
+                    let msg_model = val
                         .get("message")
                         .and_then(|m| m.get("model"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
 
+                    // author = model for assistant, None for user
+                    // model = the model for this turn (backfill users later)
+                    let (author, model) = if role != "user" {
+                        (msg_model.clone(), msg_model)
+                    } else {
+                        (None, None)
+                    };
+
                     messages.push(NormalizedMessage {
                         idx: 0, // will be re-assigned after filtering
                         role: role.to_string(),
                         author,
+                        model,
                         created_at: created,
                         content: content_str,
                         extra: val,
                         snippets: Vec::new(),
                     });
                 }
-                // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+
+                crate::connectors::finalize_messages(&mut messages);
             } else {
                 // JSON or Claude format files
                 let val: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
@@ -208,10 +231,23 @@ impl Connector for ClaudeCodeConnector {
                             continue;
                         }
 
+                        // Extract model from assistant messages
+                        let msg_model = item
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+
+                        let (author, model) = if role != "user" {
+                            (msg_model.clone(), msg_model)
+                        } else {
+                            (None, None)
+                        };
+
                         messages.push(NormalizedMessage {
                             idx: 0, // will be re-assigned after filtering
                             role: role.to_string(),
-                            author: None,
+                            author,
+                            model,
                             created_at: created,
                             content: content_str,
                             extra: item.clone(),
@@ -219,10 +255,7 @@ impl Connector for ClaudeCodeConnector {
                         });
                     }
                 }
-                // Re-assign sequential indices after filtering
-                for (i, msg) in messages.iter_mut().enumerate() {
-                    msg.idx = i as i64;
-                }
+                crate::connectors::finalize_messages(&mut messages);
             }
             if messages.is_empty() {
                 if file_count <= 3 {

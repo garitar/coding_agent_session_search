@@ -212,6 +212,7 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
             idx: 0, // Will be re-assigned after filtering
             role,
             author,
+            model: None, // TODO: extract if available
             created_at,
             content,
             extra: m.clone(),

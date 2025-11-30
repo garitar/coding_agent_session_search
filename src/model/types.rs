@@ -56,7 +56,10 @@ pub struct Message {
     pub id: Option<i64>,
     pub idx: i64,
     pub role: MessageRole,
+    /// Who wrote this message (None for user, model name for assistant)
     pub author: Option<String>,
+    /// The AI model active in this conversation (for all messages)
+    pub model: Option<String>,
     pub created_at: Option<i64>,
     pub content: String,
     pub extra_json: serde_json::Value,

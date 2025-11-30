@@ -439,6 +439,7 @@ pub mod persist {
                 idx: m.idx,
                 role: map_role(&m.role),
                 author: m.author.clone(),
+                model: m.model.clone(),
                 created_at: m.created_at,
                 content: m.content.clone(),
                 extra_json: m.extra.clone(),
@@ -500,6 +501,7 @@ mod tests {
             idx,
             role: "user".into(),
             author: Some("u".into()),
+            model: None,
             created_at: Some(created_at),
             content: format!("msg-{idx}"),
             extra: serde_json::json!({}),
@@ -563,6 +565,7 @@ mod tests {
                             idx: m.idx,
                             role: crate::model::types::MessageRole::User,
                             author: m.author.clone(),
+                            model: m.model.clone(),
                             created_at: m.created_at,
                             content: m.content.clone(),
                             extra_json: m.extra.clone(),
@@ -586,7 +589,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msg_count, 0);
-        assert_eq!(storage.schema_version().unwrap(), 3);
+        assert_eq!(storage.schema_version().unwrap(), 4);
     }
 
     #[test]

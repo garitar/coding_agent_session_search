@@ -127,6 +127,7 @@ impl Connector for ClineConnector {
                         idx: 0, // set later
                         role: role.to_string(),
                         author: None,
+                        model: None, // TODO: extract if available
                         created_at: created,
                         content: content.to_string(),
                         extra: item.clone(),

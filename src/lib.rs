@@ -115,7 +115,9 @@ pub enum Commands {
         /// Filter by agent slug (can be specified multiple times)
         #[arg(long)]
         agent: Vec<String>,
-        /// Filter by workspace path (can be specified multiple times)
+        /// Filter by workspace path (can be specified multiple times). Supports
+        /// glob patterns: "cass" matches contains, "/Users/gary*" matches prefix,
+        /// "*cass" matches suffix, "\"exact\"" matches exactly
         #[arg(long)]
         workspace: Vec<String>,
         /// Max results
@@ -178,6 +180,12 @@ pub enum Commands {
         /// Include IDE autocontext messages like "# Context from my IDE setup" (excluded by default)
         #[arg(long)]
         include_autocontext: bool,
+        /// Include tool calls/results in search results (excluded by default for cleaner results)
+        #[arg(long)]
+        search_tools: bool,
+        /// Show search pipeline statistics (raw matches, filtering, deduplication)
+        #[arg(long)]
+        explain: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -187,6 +195,9 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Verify SQLite and Tantivy index consistency
+        #[arg(long)]
+        verify: bool,
     },
     /// View a source file at a specific line (follow up on search results)
     View {
@@ -486,6 +497,8 @@ async fn execute_cli(
                     tools,
                     include_summaries,
                     include_autocontext,
+                    search_tools,
+                    explain,
                 } => {
                     run_cli_search(
                         &query,
@@ -515,10 +528,12 @@ async fn execute_cli(
                         tools,
                         include_summaries,
                         include_autocontext,
+                        search_tools,
+                        explain,
                     )?;
                 }
-                Commands::Stats { data_dir, json } => {
-                    run_stats(&data_dir, cli.db.clone(), json)?;
+                Commands::Stats { data_dir, json, verify } => {
+                    run_stats(&data_dir, cli.db.clone(), json, verify)?;
                 }
                 Commands::View {
                     path,
@@ -675,7 +690,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  (global) --quiet / -q  Suppress info logs (warnings+errors only)".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (codex, claude_code, gemini, opencode, amp, cline)".to_string(),
-            "    --workspace W     Filter by workspace path".to_string(),
+            "    --workspace W     Filter by workspace path (glob: \"cass\", \"/foo*\", \"*bar\")".to_string(),
             "    --limit N         Max results (default: 10)".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
@@ -1121,6 +1136,44 @@ fn model_matches(model: &Option<String>, patterns: &[String]) -> bool {
     })
 }
 
+/// Check if a workspace path matches any of the provided patterns.
+/// Patterns support glob-like matching (same as model_matches):
+/// - "cass" → contains (case-insensitive)
+/// - "/Users/gary*" → prefix match
+/// - "*/AI/*" → contains (explicit)
+/// - "\"/Users/gary/AI/cass\"" → exact match (quoted)
+fn workspace_matches(workspace: &Option<String>, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Some(workspace) = workspace else {
+        return false;
+    };
+    let ws_lower = workspace.to_lowercase();
+    patterns.iter().any(|pattern| {
+        let trimmed = pattern.trim();
+        // Exact match: quoted string
+        if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 2 {
+            let exact = &trimmed[1..trimmed.len() - 1];
+            return ws_lower == exact.to_lowercase();
+        }
+        let has_prefix_glob = trimmed.starts_with('*');
+        let has_suffix_glob = trimmed.ends_with('*');
+        if has_prefix_glob || has_suffix_glob {
+            let inner = trimmed.trim_matches('*').to_lowercase();
+            match (has_prefix_glob, has_suffix_glob) {
+                (true, true) => ws_lower.contains(&inner),
+                (true, false) => ws_lower.ends_with(&inner),
+                (false, true) => ws_lower.starts_with(&inner),
+                _ => unreachable!(),
+            }
+        } else {
+            // Default: contains match
+            ws_lower.contains(&trimmed.to_lowercase())
+        }
+    })
+}
+
 /// Check if content is a summary/continuation message that should be filtered out.
 /// Matches messages like "This session is being continued from a previous conversation".
 fn is_summary_message(content: &str) -> bool {
@@ -1129,11 +1182,44 @@ fn is_summary_message(content: &str) -> bool {
         || content.contains("context compaction")
 }
 
-/// Check if content is an IDE autocontext message that should be filtered out.
+/// Check if content is an IDE autocontext message.
 /// Matches messages starting with "# Context from my IDE setup".
 fn is_autocontext_message(content: &str) -> bool {
     content.starts_with("# Context from my IDE setup")
         || content.contains("\n# Context from my IDE setup")
+}
+
+/// Extract the actual user request from Codex autocontext messages.
+///
+/// Codex IDE integration prepends context like:
+/// ```
+/// # Context from my IDE setup:
+/// ## Active file: ...
+/// ## Open tabs: ...
+/// ## My request for Codex:
+/// <actual user request>
+/// ```
+///
+/// This function extracts just the user request, discarding the boilerplate.
+/// Returns the original content if no autocontext pattern is found.
+fn extract_user_request(content: &str) -> String {
+    // Check if this is an autocontext message
+    if !content.starts_with("# Context from my IDE setup") {
+        return content.to_string();
+    }
+
+    // Look for the "## My request for Codex:" marker
+    const MARKER: &str = "## My request for Codex:";
+    if let Some(idx) = content.find(MARKER) {
+        let request_start = idx + MARKER.len();
+        let request = content[request_start..].trim();
+        if !request.is_empty() {
+            return request.to_string();
+        }
+    }
+
+    // Fallback: return original if marker not found or request is empty
+    content.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1158,6 +1244,8 @@ fn run_cli_search(
     tools: Option<usize>,
     include_summaries: bool,
     include_autocontext: bool,
+    search_tools: bool,
+    explain: bool,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -1199,19 +1287,22 @@ fn run_cli_search(
     if !agents.is_empty() {
         filters.agents = HashSet::from_iter(agents.iter().cloned());
     }
-    if !workspaces.is_empty() {
-        filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
-    }
+    // Workspace filtering is done via post-filter to support glob patterns
+    // (same approach as model filtering)
+    let workspace_patterns: Vec<String> = workspaces.to_vec();
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;
     filters.role = from.clone();
     filters.models = model_patterns.clone();
+    // Exclude tool messages by default unless --search-tools is passed
+    filters.exclude_tools = !search_tools;
 
     // Determine if we need post-filtering (which may reduce result count below limit)
+    // Note: autocontext doesn't filter anymore (it transforms), so not included here
     let needs_post_filter = from.is_some()
         || !model_patterns.is_empty()
-        || !include_summaries
-        || !include_autocontext;
+        || !workspace_patterns.is_empty()
+        || !include_summaries;
 
     // Helper closure to apply all post-filters to a hit
     let passes_filters = |hit: &crate::search::query::SearchHit| -> bool {
@@ -1223,7 +1314,14 @@ fn run_cli_search(
         }
         // Model filter
         if !model_patterns.is_empty() {
-            if !model_matches(&hit.author, &model_patterns) {
+            if !model_matches(&hit.model, &model_patterns) {
+                return false;
+            }
+        }
+        // Workspace filter (supports glob patterns like model)
+        if !workspace_patterns.is_empty() {
+            let ws = if hit.workspace.is_empty() { None } else { Some(hit.workspace.clone()) };
+            if !workspace_matches(&ws, &workspace_patterns) {
                 return false;
             }
         }
@@ -1231,10 +1329,8 @@ fn run_cli_search(
         if !include_summaries && is_summary_message(&hit.content) {
             return false;
         }
-        // Autocontext filter
-        if !include_autocontext && is_autocontext_message(&hit.content) {
-            return false;
-        }
+        // Note: autocontext is no longer filtered out - instead we extract the user request
+        // from autocontext messages at display time (unless --include-autocontext is set)
         true
     };
 
@@ -1246,6 +1342,10 @@ fn run_cli_search(
     let mut raw_offset = 0usize;
     let batch_size = if needs_post_filter { target_count.max(50) } else { target_count };
     let max_iterations = 20; // Safety limit to avoid infinite loops
+
+    // Track counts for --explain
+    let mut total_raw = 0usize;
+    let mut total_filtered = 0usize;
 
     for _ in 0..max_iterations {
         let batch = client
@@ -1262,6 +1362,7 @@ fn run_cli_search(
         if batch_len == 0 {
             break; // No more results available
         }
+        total_raw += batch_len;
 
         for mut hit in batch {
             // Enrich Tantivy hits with role/model from SQLite (needed for filtering)
@@ -1270,6 +1371,7 @@ fn run_cli_search(
             }
 
             if passes_filters(&hit) {
+                total_filtered += 1;
                 hits.push(hit);
                 if hits.len() >= target_count {
                     break;
@@ -1291,6 +1393,34 @@ fn run_cli_search(
 
     // Apply offset: skip first `offset` filtered results, keep up to `limit`
     let mut hits: Vec<_> = hits.into_iter().skip(*offset).take(*limit).collect();
+
+    // Show explain output if requested
+    if explain {
+        eprintln!("=== Search Explain ===");
+        eprintln!("Query: \"{}\"", query);
+        eprintln!("Tantivy raw matches: {}", total_raw);
+        eprintln!("After post-filters: {}", total_filtered);
+        eprintln!("After offset/limit: {} (offset={}, limit={})", hits.len(), offset, limit);
+        if total_raw > total_filtered {
+            eprintln!("Filters applied: role={:?}, model={:?}, workspace={}, summaries={}",
+                from.as_deref().unwrap_or("any"),
+                if model_patterns.is_empty() { "any".to_string() } else { model_patterns.join(",") },
+                if workspace_patterns.is_empty() { "any" } else { "filtered" },
+                if include_summaries { "included" } else { "excluded" });
+        }
+        eprintln!();
+    }
+
+    // Extract user request from autocontext messages (unless --include-autocontext is set)
+    // This transforms "# Context from my IDE setup:\n...\n## My request for Codex:\nActual request"
+    // into just "Actual request"
+    if !include_autocontext {
+        for hit in &mut hits {
+            if is_autocontext_message(&hit.content) {
+                hit.content = extract_user_request(&hit.content);
+            }
+        }
+    }
 
     // Fetch surrounding turns if requested
     // Parse turns as either "N" (symmetric) or "before:after" (asymmetric)
@@ -1384,7 +1514,7 @@ fn run_cli_search(
             // Better separator with hit number
             println!("{}═══════════════════════════════════════════════════════════════════{}", dim, reset);
             // Build headline with optional model (in parentheses after agent, dimmed)
-            let model_str = hit.author.as_ref()
+            let model_str = hit.model.as_ref()
                 .map(|m| format!(" {}({}){}", dim, m, reset))
                 .unwrap_or_default();
             println!("{}[{}/{}]{} Score: {:.2} | {}{} | WS: {}",
@@ -1629,6 +1759,7 @@ fn run_stats(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     json: bool,
+    verify: bool,
 ) -> CliResult<()> {
     use rusqlite::Connection;
 
@@ -1752,6 +1883,51 @@ fn run_stats(
                 old_dt.format("%Y-%m-%d"),
                 new_dt.format("%Y-%m-%d")
             );
+        }
+    }
+
+    // Verify index consistency if requested
+    if verify {
+        use tantivy::Index;
+
+        let index_path = data_dir.join("index").join(crate::search::tantivy::SCHEMA_VERSION);
+        if !index_path.exists() {
+            println!("\nVerify: Tantivy index not found at {}", index_path.display());
+        } else {
+            match Index::open_in_dir(&index_path) {
+                Ok(index) => {
+                    let reader = index.reader().map_err(|e| CliError {
+                        code: 9,
+                        kind: "reader",
+                        message: format!("Failed to get reader: {e}"),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                    let searcher = reader.searcher();
+
+                    // Count total documents in Tantivy
+                    let tantivy_count: u64 = searcher
+                        .segment_readers()
+                        .iter()
+                        .map(|r| r.num_docs() as u64)
+                        .sum();
+
+                    println!("\nIndex Verification:");
+                    println!("  SQLite messages: {}", message_count);
+                    println!("  Tantivy documents: {}", tantivy_count);
+
+                    if tantivy_count as i64 == message_count {
+                        println!("  Status: ✓ Counts match");
+                    } else {
+                        let diff = (tantivy_count as i64 - message_count).abs();
+                        println!("  Status: ✗ Mismatch ({} difference)", diff);
+                        println!("  Hint: Run 'cass index --full --force-rebuild' to rebuild");
+                    }
+                }
+                Err(e) => {
+                    println!("\nVerify: Failed to open Tantivy index: {}", e);
+                }
+            }
         }
     }
 
@@ -2143,6 +2319,58 @@ mod tests {
         assert!(model_matches(&Some("claude-opus-4".to_string()), &["sonnet".to_string(), "opus".to_string()]));
         assert!(model_matches(&Some("gpt-4o".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
         assert!(!model_matches(&Some("gemini-pro".to_string()), &["claude*".to_string(), "gpt*".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_contains_pattern() {
+        // Default pattern without globs is a case-insensitive contains match
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["cass".to_string()]));
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["CASS".to_string()]));
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["AI".to_string()]));
+        assert!(!workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["watcher".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_prefix_glob() {
+        // Pattern ending with * is a prefix match
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["/Users/gary*".to_string()]));
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["/Users*".to_string()]));
+        assert!(!workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["/home*".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_suffix_glob() {
+        // Pattern starting with * is a suffix match
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["*cass".to_string()]));
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["*/AI/cass".to_string()]));
+        assert!(!workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["*watcher".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_both_globs() {
+        // Pattern with * on both sides is a contains match (explicit)
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["*/AI/*".to_string()]));
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["*gary*".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_exact_quoted() {
+        // Quoted pattern is an exact case-insensitive match
+        assert!(workspace_matches(&Some("/Users/gary/AI/cass".to_string()), &["\"/Users/gary/AI/cass\"".to_string()]));
+        assert!(!workspace_matches(&Some("/Users/gary/AI/cass-fork".to_string()), &["\"/Users/gary/AI/cass\"".to_string()]));
+    }
+
+    #[test]
+    fn workspace_matches_empty_patterns() {
+        // Empty patterns list matches everything
+        assert!(workspace_matches(&Some("/any/path".to_string()), &[]));
+        assert!(workspace_matches(&None, &[]));
+    }
+
+    #[test]
+    fn workspace_matches_none_workspace() {
+        // None workspace doesn't match any pattern (except empty list)
+        assert!(!workspace_matches(&None, &["cass".to_string()]));
     }
 
     #[test]
