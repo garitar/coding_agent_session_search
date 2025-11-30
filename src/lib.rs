@@ -1553,9 +1553,8 @@ fn run_cli_search(
                     }
                 } else {
                     // Truncated preview
-                    let effective_len = if snippet_len == 200 { 500 } else { snippet_len }; // Default to longer for this format
-                    let preview: String = hit.content.chars().take(effective_len).collect();
-                    let ellipsis = if hit.content.chars().count() > effective_len { "..." } else { "" };
+                    let preview: String = hit.content.chars().take(snippet_len).collect();
+                    let ellipsis = if hit.content.chars().count() > snippet_len { "..." } else { "" };
                     for line in preview.lines() {
                         println!("  {}", line);
                     }
