@@ -930,6 +930,7 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
         _ => (match_line.saturating_sub(50), match_line + 10), // Backward for assistant text
     };
     let mut found_turn_boundary = false;
+    let is_assistant_match = match_role != Some("user");
 
     for (idx, line_result) in reader.lines().enumerate() {
         let line_num = idx + 1; // 1-indexed
@@ -951,6 +952,21 @@ fn fetch_tools_from_source(source_path: &str, match_line: usize, limit: usize, m
         };
 
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // For assistant matches scanning backward: check for user TEXT boundary
+        // If we hit a user text message before the match, clear tools (they belong to previous turn)
+        if is_assistant_match && line_num < match_line {
+            if msg_type == "user" {
+                if let Some(content) = val.get("message").and_then(|m| m.get("content")) {
+                    // If content is a string (text), it's a turn boundary - clear previous tools
+                    if content.is_string() {
+                        tools.clear();
+                        tool_calls.clear();
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Check for turn boundary (text message that's not tool-related)
         // For user match looking forward: stop at next user text message
